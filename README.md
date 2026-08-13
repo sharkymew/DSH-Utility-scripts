@@ -1,4 +1,4 @@
-# DeepSeek Harness 多平台安装器
+# DeepSeek Harness 多平台实用脚本
 
 一套面向 **macOS / Linux / Windows** 的 DeepSeek Harness（`dsh`）安装与管理工具，支持两种官方安装方式，并附带服务管理、插件安装/卸载、更新、dsh 技能集成等实用功能。
 
