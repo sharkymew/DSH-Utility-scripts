@@ -75,7 +75,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 install -y --mod
 
 | 选项 | 说明 |
 | --- | --- |
-| `-m, --mode npx|source` | 安装方式（默认交互选择；非交互默认 npx） |
+| `-m, --mode npx\|source` | 安装方式（默认交互选择；非交互默认 npx） |
 | `-d, --dir <路径>` | 源码模式安装目录（默认 `~/deepseek-harness`） |
 | `-p, --port <端口>` | Web UI 端口（默认 3080） |
 | `-H, --host <地址>` | 绑定地址（默认 127.0.0.1） |
