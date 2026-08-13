@@ -214,4 +214,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 install -y --mod
 本工具是独立第三方便利脚本，与 DeepSeek Harness 官方项目无隶属关系；安装、升级行为最终以 [官方仓库](https://github.com/deepseek-ai/deepseek-harness) 为准。开发者预览期接口变动频繁，若 dsh 命令行为变化导致安装器失配，欢迎反馈。
 
 ## 鸣谢
-[LINUX DO](https://https://linux.do/)提供的交流社区
+[LINUX DO](https://linux.do/)提供的交流社区
