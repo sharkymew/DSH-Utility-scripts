@@ -15,7 +15,7 @@
 #    plugin       插件管理: add | remove | update | list | search
 #    info         查看环境与安装信息（支持 --json）
 #    open         在浏览器打开 Web UI
-#    skill        把本安装器注册为 dsh 技能（dsh 可直接调用本工具装插件）
+#    skill        可选注册 dsh 技能（实验性，未经完整测试）
 #    uninstall    卸载（--purge 同时删除 ~/.dsh 数据目录）
 #    version      显示版本号
 #
@@ -58,6 +58,9 @@ $script:NodeDir = Join-Path $CfgDir "node"
 if ($env:DSH_HOME) { $script:DshHome = $env:DSH_HOME }
 else { $script:DshHome = Join-Path $HomeDir ".dsh" }
 $script:SkillDir = Join-Path $DshHome "skills/dsh-installer"
+$script:SkillMarker = Join-Path $SkillDir ".installed-by-dsh-installer"
+# 源码归属标记放在 .git 内，避免污染用户工作区或触发“未提交变更”判定。
+$script:SourceMarkerName = ".git/dsh-installer-owned"
 if ($PSCommandPath) { $script:PsScriptPath = (Resolve-Path $PSCommandPath).Path }
 elseif ($PSScriptRoot) { $script:PsScriptPath = Join-Path $PSScriptRoot "install.ps1" }
 else { $script:PsScriptPath = Join-Path (Get-Location) "install.ps1" }
@@ -73,7 +76,6 @@ $script:Yes = $false
 $script:Quiet = $false
 $script:JsonOut = $false
 $script:NoStart = $false
-$script:NoSkill = $false
 $script:NodeMajor = $DefaultNodeMajor
 $script:CloneUrl = ""
 
@@ -93,6 +95,34 @@ function Confirm-Action([string]$msg, [bool]$defaultYes) {
   $ans = Read-Host -Prompt "$msg [$hint]"
   if ([string]::IsNullOrWhiteSpace($ans)) { return $defaultYes }
   return ($ans -match "^(y|yes)$")
+}
+
+# 外部安装清理不接受普通 -y 自动确认：必须在可交互终端中再次明确同意。
+function Confirm-ExternalRemoval([string]$msg) {
+  if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) {
+    Write-Err "外部安装清理只能在可交互终端中确认，拒绝在 -y/CI 模式执行"
+    return $false
+  }
+  $ans = Read-Host -Prompt "$msg [y/N]"
+  return ($ans -match "^(y|yes)$")
+}
+
+function Set-CommandFlags([object[]]$argsList, [bool]$allowJson = $false) {
+  foreach ($arg in @($argsList)) {
+    switch ([string]$arg) {
+      "-y" { $script:Yes = $true }
+      "--yes" { $script:Yes = $true }
+      "-q" { $script:Quiet = $true }
+      "--quiet" { $script:Quiet = $true }
+      "--json" {
+        if (-not $allowJson) { Exit-Die "此命令不支持 --json" }
+        $script:JsonOut = $true
+      }
+      "-h" { Show-Usage; exit 0 }
+      "--help" { Show-Usage; exit 0 }
+      default { Exit-Die "未知选项: $arg" }
+    }
+  }
 }
 
 function Add-ToUserPath([string]$dir) {
@@ -196,6 +226,8 @@ function Install-NodeViaZip {
   # 仅当旧目录带有本工具 marker 时才删除（防止误删用户同名目录）
   if ((Test-Path $NodeDir) -and (Test-Path (Join-Path $NodeDir ".installed-by-dsh-installer"))) {
     Remove-Item $NodeDir -Recurse -Force
+  } elseif (Test-Path $NodeDir) {
+    Exit-Die "检测到已存在的非本安装器 Node 目录: $NodeDir，拒绝覆盖"
   }
   Expand-Archive -Path $zip -DestinationPath $CfgDir -Force
   $extracted = Join-Path $CfgDir $file.Replace(".zip", "")
@@ -276,7 +308,7 @@ function Test-Port([int]$port) {
 
 function Get-WebUrl { return ("http://" + $BindHost + ":" + $Port) }
 
-# 读取 PID 文件信息（兼容旧版纯数字格式）
+# 读取 PID 文件信息。旧版纯数字 PID 仅用于诊断，绝不用于击杀进程。
 function Get-PidInfo {
   if (-not (Test-Path $PidFile)) { return $null }
   $raw = Get-Content $PidFile -Raw -ErrorAction SilentlyContinue
@@ -285,7 +317,7 @@ function Get-PidInfo {
   try { $info = $raw | ConvertFrom-Json } catch { }
   if ($info -and $info.pid) { return $info }
   $num = 0
-  if ([int]::TryParse($raw.Trim(), [ref]$num)) { return [ordered]@{ pid = $num } }
+  if ([int]::TryParse($raw.Trim(), [ref]$num)) { return [ordered]@{ pid = $num; legacy = $true } }
   return $null
 }
 
@@ -294,15 +326,19 @@ function Get-OwnProcess {
   $script:IdentityStatus = "not-running"
   $info = Get-PidInfo
   if (-not $info) { return $null }
+  if (-not $info.start -or -not $info.script) {
+    $script:IdentityStatus = "unverifiable"
+    return $null
+  }
   $proc = Get-Process -Id ([int]$info.pid) -ErrorAction SilentlyContinue
   if (-not $proc) { return $null }
   try {
-    if ($info.start -and ($proc.StartTime.ToString("o") -ne $info.start)) {
+    if ($proc.StartTime.ToString("o") -ne $info.start) {
       $script:IdentityStatus = "mismatch"
       return $null
     }
   } catch { }
-  if ($script:IsWin -and $info.script) {
+  if ($script:IsWin) {
     try {
       $cim = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$info.pid) -ErrorAction SilentlyContinue
       if (-not $cim) { $script:IdentityStatus = "unverifiable"; return $null }
@@ -315,11 +351,9 @@ function Get-OwnProcess {
   return $proc
 }
 
-# 宽松判断：PID 文件进程存活（仅用于 status 展示 / start 成功判断，无击杀风险）
+# 只有通过身份校验的进程才视为本工具正在运行。
 function Test-Running {
-  $info = Get-PidInfo
-  if (-not $info) { return $false }
-  return [bool](Get-Process -Id ([int]$info.pid) -ErrorAction SilentlyContinue)
+  return ($null -ne (Get-OwnProcess))
 }
 
 # 参数校验：host/port/registry 白名单与格式约束
@@ -455,7 +489,11 @@ function Stop-Web {
   return 0
 }
 
-function Restart-Web { $null = Stop-Web; Start-Web }
+function Restart-Web {
+  $stopResult = Stop-Web
+  if ($stopResult -eq 1) { return 1 }
+  Start-Web
+}
 
 # 安装锚点：配置文件存在（记录过一次安装），源码模式还需仓库标记在
 function Test-Installed {
@@ -562,6 +600,7 @@ function Install-Source {
   $repoUrl = $script:CloneUrl
   if (-not $repoUrl) { $repoUrl = $GithubRepo }
   $gitDir = Join-Path $InstallDir ".git"
+  $clonedByInstaller = $false
   if ((Test-Path $gitDir) -and (Test-RepoMarker $InstallDir)) {
     Write-Info "检测到现有仓库 $InstallDir，执行 git pull 更新"
     & git -C $InstallDir pull --ff-only
@@ -572,6 +611,10 @@ function Install-Source {
     Write-Info "克隆 $repoUrl → $InstallDir"
     & git clone --depth 1 $repoUrl $InstallDir
     if ($LASTEXITCODE -ne 0) { Exit-Die "克隆失败（可加 --clone-url 指定镜像地址）" }
+    $clonedByInstaller = $true
+  }
+  if ($clonedByInstaller) {
+    New-Item -ItemType File -Path (Join-Path $InstallDir $script:SourceMarkerName) -Force | Out-Null
   }
   Write-Info "安装依赖 pnpm install（首次约需几分钟）..."
   $oldReg = $env:NPM_CONFIG_REGISTRY
@@ -605,7 +648,7 @@ function Show-InstallHelp {
   --api-key <密钥>        写入 DEEPSEEK_API_KEY 到 ~/.dsh/.env
   --node-version <主版本> 自动安装的 Node 主版本（默认 24）
   --no-start              安装后不启动
-  --no-skill              不注册 dsh 技能
+  注：Skill 默认不会注册；需要时显式执行 install.ps1 skill（实验性，未经完整测试）
   -y, --yes               非交互模式
   -q, --quiet             只输出错误
 "@
@@ -639,7 +682,7 @@ function Invoke-Install([object[]]$argsList = $null) {
       "^--clone-url=" { $argClone = $a.Substring(12) }
       "^(-y|--yes)$" { $script:Yes = $true }
       "^--no-start$" { $script:NoStart = $true }
-      "^--no-skill$" { $script:NoSkill = $true }
+      "^--no-skill$" { Write-Warn "Skill 默认不会注册，--no-skill 已无需要" }
       "^(-q|--quiet)$" { $script:Quiet = $true }
       "^(-h|--help)$" { Show-InstallHelp; exit 0 }
       default { Exit-Die "未知选项: $a（查看帮助: install.ps1 install --help）" }
@@ -705,11 +748,11 @@ function Invoke-Install([object[]]$argsList = $null) {
   }
 
   Write-Launcher
-  Install-Skill
   Save-Config
 
   Write-Host ""
   Write-Ok "安装完成！"
+  Write-Info "可选功能：如需注册 dsh-installer Skill，请显式执行 install.ps1 skill（实验性，未经完整测试）"
   Write-Host "  启动 Web UI : $(Get-WebUrl)"
   Write-Host "  下次启动    : dsh-web  或  install.ps1 start"
   Write-Host "  插件管理    : install.ps1 plugin add <包名|github:用户/仓库|./路径>"
@@ -753,28 +796,29 @@ function Invoke-Plugin([object[]]$cliArgs = $null) {
     if ($a -eq "--json") { $script:JsonOut = $true; continue }
     if ($a -eq "--profile") { if ($cliArgs[$i + 1]) { $profile = [string]$cliArgs[$i + 1]; $i++ }; continue }
     if ($a -like "--profile=*") { $profile = $a.Substring(10); continue }
+    if (($a -eq "-y") -or ($a -eq "--yes")) { $script:Yes = $true; continue }
     if (($a -eq "-q") -or ($a -eq "--quiet")) { $script:Quiet = $true; continue }
     if (-not $action) { $action = $a }
     else { $argsList.Add($a) }
   }
   if (-not $action) { $action = "list" }
   switch -Regex ($action) {
-    "^(add|install|i)$" { Run-PluginCmd $profile "add" $argsList }
-    "^(remove|rm|uninstall|del)$" { Run-PluginCmd $profile "remove" $argsList }
-    "^(update|upgrade|up)$" { Run-PluginCmd $profile "update" $argsList }
+    "^(add|install|i)$" { return (Run-PluginCmd $profile "add" $argsList) }
+    "^(remove|rm|uninstall|del)$" { return (Run-PluginCmd $profile "remove" $argsList) }
+    "^(update|upgrade|up)$" { return (Run-PluginCmd $profile "update" $argsList) }
     "^(list|ls)$" {
       if ($script:JsonOut) { Get-PluginListJson $profile }
       else { Get-PluginListText $profile }
     }
-    "^(search|s)$" { Search-Plugin $argsList }
-    default { Write-Err "用法: install.ps1 plugin <add|remove|update|list|search> [参数]"; exit 1 }
+    "^(search|s)$" { return (Search-Plugin $argsList) }
+    default { Write-Err "用法: install.ps1 plugin <add|remove|update|list|search> [参数]"; return 1 }
   }
 }
 
 function Run-PluginCmd([string]$profile, [string]$pnpmAction, $argsList) {
   if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
     Write-Warn "插件管理需要 pnpm，尝试安装 ..."
-    if (-not (Ensure-Pnpm)) { Exit-Die "pnpm 不可用" }
+    if (-not (Ensure-Pnpm)) { Write-Err "pnpm 不可用"; return 1 }
   }
   $oldReg = $env:NPM_CONFIG_REGISTRY
   if ($script:Registry) { $env:NPM_CONFIG_REGISTRY = $script:Registry }
@@ -784,14 +828,14 @@ function Run-PluginCmd([string]$profile, [string]$pnpmAction, $argsList) {
       Push-Location $InstallDir
       try {
         $all = @("dsh", "plugin", "--profile", $profile, $pnpmAction) + @($argsList)
-        & (Get-ExeName "pnpm") @all
+        & (Get-ExeName "pnpm") @all | Out-Host
         $rc = $LASTEXITCODE
       } finally { Pop-Location }
     } else {
       Push-Location $HomeDir
       try {
         $all = @("--yes", $NpxPkg, "plugin", "--profile", $profile, $pnpmAction) + @($argsList)
-        & (Get-ExeName "npx") @all
+        & (Get-ExeName "npx") @all | Out-Host
         $rc = $LASTEXITCODE
       } finally { Pop-Location }
     }
@@ -804,7 +848,7 @@ function Run-PluginCmd([string]$profile, [string]$pnpmAction, $argsList) {
     Write-Warn "  交互终端中可直接按 pnpm 提示批准；或手动执行:"
     Write-Warn ("  dsh plugin --profile " + $profile + " approve-builds")
   }
-  exit $rc
+  return $rc
 }
 
 function Get-PluginData([string]$profile) {
@@ -851,7 +895,7 @@ function Search-Plugin($argsList) {
     else { Remove-Item Env:NPM_CONFIG_REGISTRY -ErrorAction SilentlyContinue }
   }
   if (-not $raw.Trim()) { Exit-Die "插件搜索失败（检查网络或 npm registry）" }
-  try { $items = @($raw | ConvertFrom-Json) } catch { Write-Host $raw; exit 0 }
+  try { $items = @($raw | ConvertFrom-Json) } catch { Write-Host $raw; return 0 }
   $top = @($items | Select-Object -First 30)
   if ($script:JsonOut) {
     $out = @()
@@ -878,8 +922,13 @@ function Get-NpxCacheDir {
 
 function Clear-NpxCache {
   $npxCache = Get-NpxCacheDir
-  if (Test-Path $npxCache) {
-    Remove-Item $npxCache -Recurse -Force -ErrorAction SilentlyContinue
+  if (-not (Test-Path $npxCache)) { return }
+  # _npx 是 npm 用户共享的缓存；只删除明确包含 dsh 的条目，不影响其他 npx 程序。
+  Get-ChildItem -LiteralPath $npxCache -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    $dshPkg = Join-Path $_.FullName "node_modules/@deepseek-ai/dsh"
+    if (Test-Path $dshPkg) {
+      Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 
@@ -949,9 +998,50 @@ function Remove-OwnedShims {
 }
 
 # 扫描并清理外部安装（独立危险操作：先展示清单，默认取消）
+function Test-SafeExternalSourceRepo([string]$path) {
+  if (($path -eq $HomeDir) -or ([System.IO.Path]::GetPathRoot($path) -eq $path)) {
+    Write-Warn ("拒绝删除不安全路径: " + $path)
+    return $false
+  }
+  if (-not (Test-RepoMarker $path)) {
+    Write-Warn ("非 DSH 源码仓库，跳过: " + $path)
+    return $false
+  }
+  $origin = ""
+  try { $origin = [string]((& git -C $path remote get-url origin 2>$null | Select-Object -First 1)).Trim() } catch { }
+  $official = @(
+    "https://github.com/deepseek-ai/deepseek-harness.git",
+    "https://github.com/deepseek-ai/deepseek-harness",
+    "git@github.com:deepseek-ai/deepseek-harness.git",
+    "git@github.com:deepseek-ai/deepseek-harness",
+    "ssh://git@github.com/deepseek-ai/deepseek-harness.git"
+  )
+  if ($official -notcontains $origin) {
+    Write-Warn ("仓库 origin 非官方地址，保留: " + $path)
+    return $false
+  }
+  $dirty = ""
+  try { $dirty = & git -C $path status --porcelain 2>$null } catch { }
+  if ($dirty) {
+    Write-Warn ("仓库有未提交改动，保留: " + $path)
+    return $false
+  }
+  $localCommits = ""
+  try { $localCommits = [string]((& git -C $path rev-list --count HEAD --not --remotes 2>$null | Select-Object -First 1)).Trim() } catch { }
+  if ($localCommits -notmatch "^\d+$") {
+    Write-Warn ("无法验证是否含仅本地提交，保留: " + $path)
+    return $false
+  }
+  if ($localCommits -ne "0") {
+    Write-Warn ("仓库含仅本地提交，保留: " + $path)
+    return $false
+  }
+  return $true
+}
+
 function Remove-ExternalInstalls([string]$extraDir = "") {
   $found = New-Object System.Collections.Generic.List[string]
-  foreach ($p in @(Find-ExternalPkgs)) { if (-not $found.Contains($p)) { $found.Add("global:" + $p) } }
+  foreach ($p in @(Find-ExternalPkgs)) { if (-not $found.Contains("global:" + $p)) { $found.Add("global:" + $p) } }
   foreach ($r in @(Find-SourceRepos)) { if (-not $found.Contains("repo:" + $r)) { $found.Add("repo:" + $r) } }
   if ($extraDir -and (Test-RepoMarker $extraDir)) { $found.Add("repo:" + $extraDir) }
   if ($found.Count -eq 0) {
@@ -962,7 +1052,7 @@ function Remove-ExternalInstalls([string]$extraDir = "") {
   Write-Warn "以下为本工具之外的安装（先展示清单，默认不删除）:"
   foreach ($item in $found) { Write-Host ("    " + $item) }
   Write-Host ""
-  if (-not (Confirm-Action "确认清理以上全部外部安装？" $false)) {
+  if (-not (Confirm-ExternalRemoval "确认清理以上全部外部安装？")) {
     Write-Info "已取消（核对清单后再执行）"
     return 0
   }
@@ -979,15 +1069,7 @@ function Remove-ExternalInstalls([string]$extraDir = "") {
         Write-Ok ("已删除全局安装: " + $path)
       }
     } else {
-      if (($path -eq $HomeDir) -or ([System.IO.Path]::GetPathRoot($path) -eq $path)) {
-        Write-Warn ("拒绝删除不安全路径: " + $path)
-        continue
-      }
-      $dirty = ""
-      try { $dirty = & git -C $path status --porcelain 2>$null } catch { }
-      if ($dirty) {
-        Write-Warn ("仓库有未提交改动，跳过: " + $path)
-      } else {
+      if (Test-SafeExternalSourceRepo $path) {
         Remove-Item $path -Recurse -Force
         Write-Ok ("已删除源码仓库: " + $path)
       }
@@ -1043,7 +1125,8 @@ function Invoke-Update {
   }
   if ($wasRunning) {
     Write-Info "重启 Web UI ..."
-    Stop-Web *> $null
+    $stopResult = Stop-Web
+    if ($stopResult -eq 1) { Exit-Die "更新后未重启：原 Web UI 停止失败，为避免重复启动已中止" }
     Start-Web
   }
 }
@@ -1057,7 +1140,9 @@ function Show-Info {
   try { $pv = "v" + (& pnpm --version 2>$null | Select-Object -First 1) } catch { }
   try { $gv = (& git --version 2>$null | Select-Object -First 1).Replace("git version ", "") } catch { }
   $running = Test-Running
-  $pidVal = Get-Content $PidFile -ErrorAction SilentlyContinue
+  $pidVal = $null
+  $pidInfo = Get-PidInfo
+  if ($pidInfo) { $pidVal = $pidInfo.pid }
   if ($script:JsonOut) {
     $o = [ordered]@{
       app = $AppName; version = $AppVersion
@@ -1089,44 +1174,42 @@ function Show-Info {
 
 # ---------------------------------------------------------------- dsh 技能
 function Install-Skill {
-  if ($script:NoSkill) { return }
   New-Item -ItemType Directory -Path $SkillDir -Force | Out-Null
   $content = @'
 ---
 name: dsh-installer
-description: DeepSeek Harness 安装、服务与插件管理工具。当用户要求安装/更新/卸载 DeepSeek Harness，安装/移除/搜索 dsh 插件，或启动/停止/查看 Web UI 服务时使用。
+description: 可选的实验性 DeepSeek Harness 安装、服务与插件管理提示。未经完整测试；仅在用户明确要求使用 dsh-installer 时参考，任何删除操作均须再次取得明确同意。
 ---
 
-# DeepSeek Harness 安装器（dsh-installer）
+# DeepSeek Harness 安装器（可选实验性 Skill）
 
-通过 dsh-installer 命令管理 DeepSeek Harness 本体与插件。所有命令必须非交互（加 -y），机器结果用 --json。
+> 本 Skill 是可选功能，未经完整测试，安装器默认不会注册它。它不是“自动注入”或“默认执行”规则；只有用户明确要求使用 dsh-installer 时才可参考。
+
+通过 dsh-installer 命令管理 DeepSeek Harness 本体与插件。查询状态可使用 `--json`；涉及安装、更新、启动、停止、插件变更和卸载前，先向用户说明将执行的操作，得到明确同意后再执行。
 
 ## 定位安装器
 优先执行 **command -v dsh-installer**（Linux/macOS）或 **dsh-installer.cmd**（Windows）；否则依次尝试 **~/.local/bin/dsh-installer**、**bash ~/DSH-installer/install.sh**。
 
-## 命令速查
-- 安装: **dsh-installer install -y --mode npx|source --port 3080**
+## 非破坏性命令速查
 - 状态: **dsh-installer status --json**（读 running 字段）
-- 启动/停止/重启: **dsh-installer start|stop|restart -y**
-- 插件安装: **dsh-installer plugin add 包名 或 github:用户/仓库 或 ./路径 或 .tgz -y**
-- 插件移除: **dsh-installer plugin remove 包名 -y**
 - 插件列表: **dsh-installer plugin list --json**
 - 插件搜索: **dsh-installer plugin search 关键词 --json**
-- 更新: **dsh-installer update -y**
-- 卸载: **dsh-installer uninstall -y --purge**
 
 ## 规则
-1. 每条命令都带 -y；失败先看日志 **dsh-installer logs -n 30** 再决定重试。
-2. 安装/移除插件后需要重启 Web UI 才生效：**dsh-installer restart -y**。
-3. 要求 Node.js >= 22.19 或 >= 24；缺失时安装器自动装到用户目录（无需 sudo/管理员）。
-4. 国内网络失败时加 **--registry https://registry.npmmirror.com** 重试。
+1. 不要为了自动化而默认追加 `-y`；只有用户明确希望非交互执行时才加。
+2. `uninstall` 默认保留 `~/.dsh` 数据。绝不默认加入 `--purge` 或 `--remove-external`；这两项会删除数据或其他安装，必须单独、再次获得用户确认。
+3. 安装/移除插件后可能需要重启 Web UI 才生效。先说明影响，再按用户指示执行。
+4. 要求 Node.js >= 22.19 或 >=24；缺失时安装器可能安装到用户目录。国内网络失败时可由用户选择 `--registry https://registry.npmmirror.com`。
+5. 失败先查看 **dsh-installer logs -n 30**，不要通过扩大删除范围或放松 pnpm 安全闸门来“修复”。
 '@
   Set-Content -Path (Join-Path $SkillDir "SKILL.md") -Value $content -Encoding UTF8
-  Write-Ok "已注册 dsh 技能: $SkillDir/SKILL.md（dsh 可直接调用本安装器）"
+  New-Item -ItemType File -Path $SkillMarker -Force | Out-Null
+  Write-Ok "已注册可选实验性 dsh Skill: $SkillDir/SKILL.md"
 }
 
 function Invoke-Skill {
   Load-Config
+  Write-Warn "此 Skill 为可选实验性功能，未经完整测试；不会自动注入或默认启用"
   Install-Skill
 }
 
@@ -1167,7 +1250,8 @@ function Invoke-Uninstall([object[]]$argsList = $null) {
 
   # ---- 只清理本工具确认拥有的资源（默认不扫、不猜、不扩大范围）----
   if ($Mode -eq "source") {
-    if ((Test-Path $InstallDir) -and (Test-RepoMarker $InstallDir)) {
+    $sourceMarker = Join-Path $InstallDir $script:SourceMarkerName
+    if ((Test-Path $InstallDir) -and (Test-RepoMarker $InstallDir) -and (Test-Path $sourceMarker)) {
       $dirty = ""
       try { $dirty = & git -C $InstallDir status --porcelain 2>$null } catch { }
       if ($dirty -and -not (Confirm-Action "源码目录存在未提交改动，仍要删除？" $false)) {
@@ -1176,8 +1260,10 @@ function Invoke-Uninstall([object[]]$argsList = $null) {
         Write-Info "删除源码目录: $InstallDir"
         Remove-Item $InstallDir -Recurse -Force
       }
+    } elseif ((Test-Path $InstallDir) -and (Test-RepoMarker $InstallDir)) {
+      Write-Warn "源码目录缺少本安装器归属标记（可能是用户原有或旧版本安装），为安全起见保留: $InstallDir"
     } else {
-      Write-Info "源码目录不存在或非本安装器管理，跳过"
+      Write-Info "源码目录不存在或非 DSH 仓库，跳过"
     }
   } else {
     Write-Info "清理 npx 缓存中的 dsh ..."
@@ -1186,7 +1272,11 @@ function Invoke-Uninstall([object[]]$argsList = $null) {
 
   Remove-Item $Launcher -Force -ErrorAction SilentlyContinue
   Remove-Item $CliLink -Force -ErrorAction SilentlyContinue
-  Remove-Item $SkillDir -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path $SkillMarker) {
+    Remove-Item $SkillDir -Recurse -Force -ErrorAction SilentlyContinue
+  } elseif (Test-Path $SkillDir) {
+    Write-Warn "Skill 目录缺少本安装器归属标记，保留: $SkillDir"
+  }
   if (Test-Path (Join-Path $NodeDir ".installed-by-dsh-installer")) {
     Remove-Item $NodeDir -Recurse -Force
   }
@@ -1196,7 +1286,7 @@ function Invoke-Uninstall([object[]]$argsList = $null) {
   try {
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($userPath) {
-      $kept = @(($userPath -split ";") | Where-Object { $_ -and -not ($_ -like ($CfgDir + "*")) }) -join ";"
+      $kept = @(($userPath -split ";") | Where-Object { $_ -and ($_.TrimEnd("\\") -ine $BinDir.TrimEnd("\\")) }) -join ";"
       if ($kept -ne $userPath) {
         [Environment]::SetEnvironmentVariable("Path", $kept, "User")
         Write-Info "已清理用户 PATH 中的安装器条目"
@@ -1331,7 +1421,7 @@ function Show-Menu {
     Write-Host "    [8]  插件管理"
     Write-Host "    [9]  更新 DSH"
     Write-Host "    [10] 环境信息"
-    Write-Host "    [11] 注册 dsh 技能"
+    Write-Host "    [11] 注册可选实验性 dsh Skill（未经完整测试）"
     Write-Host "    [12] 卸载"
     Write-Host "    [0]  退出"
     $c = Read-Host "请输入数字 [0]"
@@ -1374,7 +1464,7 @@ DeepSeek Harness 多平台安装器 (Windows)
   plugin       插件管理: add | remove | update | list | search
   info         查看环境与安装信息（--json）
   open         在浏览器打开 Web UI
-  skill        把本安装器注册为 dsh 技能（dsh 可直接调用本工具）
+  skill        注册可选实验性 dsh Skill（未经完整测试；默认不注册）
   uninstall    卸载（--purge 同时删除 ~/.dsh 数据目录）
   version      显示版本号
 
@@ -1396,45 +1486,52 @@ DeepSeek Harness 多平台安装器 (Windows)
 }
 
 # ---------------------------------------------------------------- 入口
-if (-not $PSBoundParameters.ContainsKey("Command")) {
-  # 无参数启动：交互环境进菜单；非交互（dsh/CI）保持默认安装行为
-  if ([Environment]::UserInteractive) { Show-Menu; exit 0 }
+# PowerShell 会把 `install.ps1 --help` 放进 RestArgs，而不是绑定到 Command。
+# 先标准化顶层别名，避免无意进入交互菜单或开始默认安装。
+$hasExplicitCommand = $PSBoundParameters.ContainsKey("Command")
+if (-not $hasExplicitCommand -and $RestArgs.Count -gt 0) {
+  $first = [string]$RestArgs[0]
+  if (@("-h", "--help", "help", "-v", "-V", "--version", "version") -contains $first) {
+    $Command = $first
+    $hasExplicitCommand = $true
+    if ($RestArgs.Count -gt 1) { $RestArgs = @($RestArgs[1..($RestArgs.Count - 1)]) }
+    else { $RestArgs = @() }
+  }
+}
+if (-not $hasExplicitCommand -and $RestArgs.Count -eq 0) {
+  # 无参数启动：仅真正可读 stdin 的交互终端进菜单；CI/重定向输入保持默认安装行为。
+  if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) { Show-Menu; exit 0 }
 }
 switch ($Command.ToLower()) {
   "menu" { Show-Menu }
   "install" { Invoke-Install }
   "start" {
-    for ($i = 0; $i -lt $RestArgs.Count; $i++) {
-      if ([string]$RestArgs[$i] -eq "--json") { $script:JsonOut = $true }
-      if (([string]$RestArgs[$i] -eq "-q") -or ([string]$RestArgs[$i] -eq "--quiet")) { $script:Quiet = $true }
-    }
+    Set-CommandFlags $RestArgs $true
     Start-Web
   }
   "stop" {
-    for ($i = 0; $i -lt $RestArgs.Count; $i++) {
-      if ([string]$RestArgs[$i] -eq "--json") { $script:JsonOut = $true }
-      if (([string]$RestArgs[$i] -eq "-q") -or ([string]$RestArgs[$i] -eq "--quiet")) { $script:Quiet = $true }
-    }
+    Set-CommandFlags $RestArgs $true
     $r = Stop-Web
     if ($r -ne 0) { exit $r }
   }
-  "restart" { Restart-Web }
+  "restart" {
+    Set-CommandFlags $RestArgs $false
+    $r = Restart-Web
+    if ($r -is [int] -and $r -ne 0) { exit $r }
+  }
   "status" {
-    for ($i = 0; $i -lt $RestArgs.Count; $i++) {
-      if ([string]$RestArgs[$i] -eq "--json") { $script:JsonOut = $true }
-      if (([string]$RestArgs[$i] -eq "-q") -or ([string]$RestArgs[$i] -eq "--quiet")) { $script:Quiet = $true }
-    }
+    Set-CommandFlags $RestArgs $true
     $inst = Get-Status
     if (-not $inst) { exit 2 }
   }
   "logs" { Show-Logs }
-  "update" { Invoke-Update }
-  "plugin" { Invoke-Plugin }
+  "update" { Set-CommandFlags $RestArgs $false; Invoke-Update }
+  "plugin" {
+    $r = Invoke-Plugin
+    if ($r -is [int] -and $r -ne 0) { exit $r }
+  }
   "info" {
-    for ($i = 0; $i -lt $RestArgs.Count; $i++) {
-      if ([string]$RestArgs[$i] -eq "--json") { $script:JsonOut = $true }
-      if (([string]$RestArgs[$i] -eq "-q") -or ([string]$RestArgs[$i] -eq "--quiet")) { $script:Quiet = $true }
-    }
+    Set-CommandFlags $RestArgs $true
     Show-Info
   }
   "open" { Open-Web }
