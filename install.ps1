@@ -1529,6 +1529,8 @@ switch ($Command.ToLower()) {
   "plugin" {
     $r = Invoke-Plugin
     if ($r -is [int] -and $r -ne 0) { exit $r }
+    # list/search 的 JSON 走管道输出，赋值捕获后必须显式冲刷，否则输出会丢失
+    if ($r -isnot [int]) { $r }
   }
   "info" {
     Set-CommandFlags $RestArgs $true
