@@ -17,7 +17,7 @@
 #    info         查看环境与安装信息（支持 --json）
 #    open         在浏览器打开 Web UI
 #    skill        注册可选实验性 dsh Skill（默认不注册）
-#    uninstall    卸载（--purge 同时删除 ~/.dsh 数据目录）
+#    uninstall    卸载（--purge 删除 DSH_HOME；--dry-run 预览；--purge-temp 清临时残留）
 #    version      显示版本号
 #
 #  设计目标: 无 TTY 时自动非交互（可被 dsh/CI 直接调用），--json 输出机器
@@ -31,7 +31,7 @@
 set -uo pipefail
 
 APP_NAME="dsh-installer"
-APP_VERSION="1.2.0"
+APP_VERSION="1.3.0"
 NPX_PKG="@deepseek-ai/dsh"
 GITHUB_REPO="https://github.com/deepseek-ai/deepseek-harness.git"
 DEFAULT_NODE_MAJOR="24"
@@ -53,6 +53,7 @@ LAUNCHER="$BIN_DIR/dsh-web"
 CLI_LINK="$BIN_DIR/dsh-installer"
 NODE_DIR="$DATA_DIR/node"
 DSH_HOME_DIR="${DSH_HOME:-$HOME_DIR/.dsh}"
+DSH_HOME_OVERRIDE="${DSH_HOME:-}"
 SKILL_DIR="$DSH_HOME_DIR/skills/dsh-installer"
 SKILL_MARKER="$SKILL_DIR/.installed-by-dsh-installer"
 # 放在 .git 内，避免污染用户工作区或触发“未提交改动”判定。
@@ -65,7 +66,7 @@ REGISTRY="" API_KEY="" YES=0 NO_START=0 QUIET=0 JSON_OUT=0
 NODE_MAJOR="$DEFAULT_NODE_MAJOR" CLONE_URL=""
 
 # 解析脚本真实路径（支持符号链接，兼容 macOS 无 readlink -f）
-SCRIPT_PATH="$0"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if [ -L "$SCRIPT_PATH" ]; then
     LINK_TARGET="$(readlink "$SCRIPT_PATH")"
@@ -154,6 +155,52 @@ json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 # 以 POSIX 单引号编码为 shell 字面量（用于生成脚本中的 cd 等）。
 shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
+# 与 dsh-home-paths 一致：空白覆盖视为未设置，展开 ~/，相对路径转绝对路径。
+absolute_path() {
+  local path="$1" part="" result="" parts=()
+  case "$path" in '~') path="$HOME_DIR" ;; '~/'*) path="$HOME_DIR/${path#\~/}" ;; esac
+  case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
+  IFS='/' read -r -a parts <<< "$path"
+  for part in "${parts[@]}"; do
+    case "$part" in ''|.) ;; ..) result="${result%/*}" ;; *) result="$result/$part" ;; esac
+  done
+  printf '%s' "${result:-/}"
+}
+
+set_dsh_home() {
+  case "$DSH_HOME_DIR" in *[![:space:]]*) ;; *) DSH_HOME_DIR="$HOME_DIR/.dsh" ;; esac
+  case "$DSH_HOME_DIR" in *$'\n'*|*$'\r'*) die "DSH_HOME 不能包含换行符" ;; esac
+  DSH_HOME_DIR="$(absolute_path "$DSH_HOME_DIR")"
+  SKILL_DIR="$DSH_HOME_DIR/skills/dsh-installer"
+  SKILL_MARKER="$SKILL_DIR/.installed-by-dsh-installer"
+  export DSH_HOME="$DSH_HOME_DIR"
+}
+
+# 递归删除不能穿过符号链接，也不能删除系统根、用户目录或包含安装器的祖先。
+safe_cleanup_path() {
+  local path="$(absolute_path "$1")" prefix="" part="" parts=() protected=""
+  [ "$path" != "/" ] || return 1
+  for protected in "$HOME_DIR" "$SCRIPT_DIR" /usr /opt /etc /var /tmp /private /System /Library /Users /home /workspace; do
+    protected="$(absolute_path "$protected")"
+    case "$protected/" in "$path/"*) return 1 ;; esac
+  done
+  IFS='/' read -r -a parts <<< "$path"
+  for part in "${parts[@]}"; do
+    [ -n "$part" ] || continue
+    prefix="$prefix/$part"
+    [ ! -L "$prefix" ] || return 1
+  done
+}
+
+validate_purge_home() {
+  safe_cleanup_path "$DSH_HOME_DIR" || die "拒绝删除不安全的数据路径: $DSH_HOME_DIR"
+  # 自定义 home 必须曾由安装器登记，或有官方 profile / 数据目录作为归属证据。
+  if [ -d "$DSH_HOME_DIR" ] && [ "${DSH_HOME_DIR##*/}" != ".dsh" ] &&
+     [ ! -f "$DSH_HOME_DIR/.dsh-installer-home" ] && [ ! -d "$DSH_HOME_DIR/profiles" ]; then
+    die "自定义 DSH_HOME 缺少归属证据，保留: $DSH_HOME_DIR"
+  fi
+}
+
 # ---------------------------------------------------------------- 平台检测
 detect_platform() {
   case "$(uname -s)" in
@@ -170,7 +217,7 @@ detect_platform() {
 
 # ---------------------------------------------------------------- 配置存取
 load_config() {
-  [ -f "$CONFIG_FILE" ] || return 0
+  if [ ! -f "$CONFIG_FILE" ]; then set_dsh_home; return 0; fi
   # 不 source 用户配置：配置是数据，不应被当作 shell 代码执行。
   local key value
   while IFS='=' read -r key value || [ -n "$key" ]; do
@@ -181,8 +228,11 @@ load_config() {
       PORT) PORT="$value" ;;
       REGISTRY) REGISTRY="$value" ;;
       NODE_MAJOR) NODE_MAJOR="$value" ;;
+      DSH_HOME_DIR) [ -n "${DSH_HOME_OVERRIDE//[[:space:]]/}" ] || DSH_HOME_DIR="$value" ;;
     esac
   done < "$CONFIG_FILE"
+  set_dsh_home
+  [ ! -f "$DATA_DIR/pnpm/.installed-by-dsh-installer" ] || export PATH="$DATA_DIR/pnpm/bin:$PATH"
 }
 
 save_config() {
@@ -195,6 +245,7 @@ save_config() {
     printf 'PORT=%s\n' "${PORT:-$DEFAULT_PORT}"
     [ -n "$REGISTRY" ] && printf 'REGISTRY=%s\n' "$REGISTRY"
     printf 'NODE_MAJOR=%s\n' "${NODE_MAJOR:-$DEFAULT_NODE_MAJOR}"
+    printf 'DSH_HOME_DIR=%s\n' "$DSH_HOME_DIR"
   } > "$CONFIG_FILE"
 }
 
@@ -275,23 +326,20 @@ ensure_node() {
 
 # ---------------------------------------------------------------- pnpm / git
 ensure_pnpm() {
+  if [ -x "$DATA_DIR/pnpm/bin/pnpm" ]; then export PATH="$DATA_DIR/pnpm/bin:$PATH"; fi
   if command -v pnpm >/dev/null 2>&1; then
     info "pnpm v$(pnpm --version 2>/dev/null) 已就绪"
     return 0
   fi
-  info "安装 pnpm@$PNPM_VERSION ..."
-  if npm install -g "pnpm@$PNPM_VERSION" >/dev/null 2>&1; then
-    hash -r 2>/dev/null || true
-    command -v pnpm >/dev/null 2>&1 && { ok "pnpm 安装完成"; return 0; }
-  fi
-  warn "npm 全局安装失败，尝试 corepack ..."
-  corepack enable >/dev/null 2>&1 || true
-  corepack prepare "pnpm@$PNPM_VERSION" --activate >/dev/null 2>&1 || true
-  hash -r 2>/dev/null || true
-  if command -v pnpm >/dev/null 2>&1; then ok "pnpm 安装完成"; return 0; fi
-  warn "pnpm 安装失败：插件管理功能将不可用"
-  warn "可手动执行: npm install -g pnpm@$PNPM_VERSION"
-  return 1
+  # 私有 prefix：不修改 npm 全局配置，不接管其他应用的 pnpm。
+  local prefix="$DATA_DIR/pnpm"
+  [ ! -e "$prefix" ] || [ -f "$prefix/.installed-by-dsh-installer" ] || die "pnpm 目录不属于本安装器: $prefix"
+  mkdir -p "$prefix" || return 1
+  : > "$prefix/.installed-by-dsh-installer" || return 1
+  info "安装 pnpm@$PNPM_VERSION 到 $prefix ..."
+  npm install --global --prefix "$prefix" "pnpm@$PNPM_VERSION" || return 1
+  export PATH="$prefix/bin:$PATH"
+  command -v pnpm >/dev/null 2>&1
 }
 
 ensure_git() {
@@ -338,7 +386,7 @@ validate_config() {
     die "clone-url 含非法字符"
   fi
   if [ "$HOST" = "0.0.0.0" ]; then
-    confirm "警告：绑定 0.0.0.0 会把 Web UI 暴露到局域网（当前无 TLS/认证）。仍要继续？" "n" \
+    confirm "警告：绑定 0.0.0.0 会把 Web UI 暴露到局域网（当前无 TLS；最新版使用进程访问令牌，请妥善保管启动日志）。仍要继续？" "n" \
       || die "已取消（改用默认 127.0.0.1 即可）"
   fi
 }
@@ -366,6 +414,10 @@ scan_external_pkgs() {
     root="$(npm root -g 2>/dev/null | tail -1)"
     [ -n "$root" ] && [ -d "$root/@deepseek-ai/dsh" ] && echo "global:$root/@deepseek-ai/dsh"
   fi
+  if command -v yarn >/dev/null 2>&1; then
+    root="$(yarn global dir 2>/dev/null | tail -1)/node_modules"
+    [ -d "$root/@deepseek-ai/dsh" ] && echo "global:$root/@deepseek-ai/dsh"
+  fi
   if command -v pnpm >/dev/null 2>&1; then
     root="$(pnpm root -g 2>/dev/null | tail -1)"
     [ -n "$root" ] && [ -d "$root/@deepseek-ai/dsh" ] && echo "global:$root/@deepseek-ai/dsh"
@@ -389,6 +441,7 @@ scan_external_pkgs() {
 # 纯只读扫描：常见位置的源码仓库。输出格式: repo:<路径>
 scan_source_repos() {
   local base="" candidate=""
+  if [ -d "$INSTALL_DIR/.git" ] && repo_marker "$INSTALL_DIR"; then echo "repo:$INSTALL_DIR"; fi
   for base in "$HOME_DIR" "$HOME_DIR/Dev" "$HOME_DIR/dev" "$HOME_DIR/Development" "$HOME_DIR/development" \
       "$HOME_DIR/projects" "$HOME_DIR/code" "$HOME_DIR/git" "$HOME_DIR/repos" \
       "$HOME_DIR/source" "$HOME_DIR/src" "$HOME_DIR/workspace" \
@@ -412,7 +465,7 @@ cleanup_owned_shims() {
       [ -d "$d" ] || continue
       for shim in dsh dsh.cmd dsh.ps1 dsh-pwsh; do
         for target in "$d/bin/$shim" "$d/installation/bin/$shim"; do
-          [ -e "$target" ] || continue
+          [ -e "$target" ] || [ -L "$target" ] || continue
           if [ -L "$target" ]; then
             readlink "$target" 2>/dev/null | grep -q '@deepseek-ai/dsh' && rm -f "$target"
           elif [ -f "$target" ] && grep -q '@deepseek-ai/dsh' "$target" 2>/dev/null; then
@@ -430,8 +483,16 @@ clear_npx_dsh_cache() {
   [ -d "$cache_dir" ] || return 0
   for entry in "$cache_dir"/*; do
     [ -d "$entry" ] || continue
-    [ -d "$entry/node_modules/@deepseek-ai/dsh" ] && rm -rf -- "$entry"
+    if [ -f "$entry/node_modules/@deepseek-ai/dsh/package.json" ] &&
+       grep -q '"name"[[:space:]]*:[[:space:]]*"@deepseek-ai/dsh"' "$entry/node_modules/@deepseek-ai/dsh/package.json"; then
+      if command -v cleanup_remove >/dev/null 2>&1; then
+        cleanup_remove tree "$entry"
+      else
+        safe_cleanup_path "$entry" && rm -rf -- "$entry" || return 1
+      fi
+    fi
   done
+  return 0
 }
 
 # 统一执行 dsh 命令（自动选择 npx / 源码运行方式）。不经 sh -c 拼接用户参数。
@@ -457,13 +518,14 @@ write_run_script() {
   {
     echo '#!/usr/bin/env bash'
     echo "# Generated by $APP_NAME $APP_VERSION — do not edit."
-    printf 'export PATH=%s:$PATH\n' "$(shell_quote "$BIN_DIR")"
+    printf 'export PATH=%s:%s:$PATH\n' "$(shell_quote "$DATA_DIR/pnpm/bin")" "$(shell_quote "$BIN_DIR")"
+    printf 'export DSH_HOME=%s\n' "$(shell_quote "$DSH_HOME_DIR")"
     if [ -n "$REGISTRY" ]; then printf 'export npm_config_registry=%s\n' "$(shell_quote "$REGISTRY")"; fi
     printf 'cd %s\n' "$(shell_quote "$run_dir")"
     if [ "${MODE:-npx}" = "npx" ]; then
-      printf 'exec npx --yes %s web --host %s --port %s\n' "$NPX_PKG" "$HOST" "$PORT"
+      printf 'exec npx --yes %s web --host %s --port %s --no-open\n' "$NPX_PKG" "$HOST" "$PORT"
     else
-      printf 'exec pnpm dsh web --host %s --port %s\n' "$HOST" "$PORT"
+      printf 'exec pnpm dsh web --host %s --port %s --no-open\n' "$HOST" "$PORT"
     fi
   } > "$RUN_SCRIPT"
   chmod +x "$RUN_SCRIPT"
@@ -474,7 +536,7 @@ ensure_bin_dir_on_path() {
   if printf '%s' ":$PATH:" | grep -q ":$BIN_DIR:"; then
     return 0
   fi
-  export PATH="$BIN_DIR:$PATH"
+  export PATH="$DATA_DIR/pnpm/bin:$BIN_DIR:$PATH"
   warn "提示: $BIN_DIR 已加入当前进程 PATH；新终端还需持久化设置"
   warn "  可执行: export PATH=\"$BIN_DIR:\$PATH\"（或加入 ~/.bashrc / ~/.zshrc）"
   # 不让 -y/CI 隐式修改 shell 启动文件；只有用户交互选择后才写入。
@@ -539,6 +601,7 @@ cmd_start() {
   load_config
   [ -n "${MODE:-}" ] || MODE="npx"
   validate_config
+  INSTALL_DIR="$(absolute_path "$INSTALL_DIR")"
   if [ "$MODE" = "source" ] && [ ! -d "${INSTALL_DIR:-$HOME_DIR/deepseek-harness}" ]; then
     die "未找到源码目录 ${INSTALL_DIR:-}，请先执行: $0 install -y --mode source"
   fi
@@ -550,7 +613,10 @@ cmd_start() {
   if port_open; then
     die "端口 $PORT 已被其他程序占用（非本工具管理的进程），请更换端口或自行处理"
   fi
+  umask 077
   write_run_script
+  chmod 700 "$CFG_DIR"
+  touch "$LOG_FILE" && chmod 600 "$LOG_FILE" || die "无法保护启动日志"
   info "后台启动 Web UI ..."
   nohup "$RUN_SCRIPT" >>"$LOG_FILE" 2>&1 &
   local pid=$!
@@ -576,6 +642,57 @@ cmd_start() {
   tail -n 10 "$LOG_FILE" 2>/dev/null | sed 's/^/    /' >&2 || true
   rm -f "$PID_FILE"
   return 1
+}
+
+# 按 PPID 快照收集后代，记录启动时间，避免杀到复用的 PID；macOS/Linux 共用 ps。
+child_process_ids() {
+  local parent="$1" table="$2" child=""
+  for child in $(printf '%s\n' "$table" | awk -v parent="$parent" '$2 == parent { print $1 }'); do
+    child_process_ids "$child" "$table"
+    printf '%s\n' "$child"
+  done
+}
+
+process_record_alive() {
+  local pid="$1" start="$2" state=""
+  [ "$(pid_start_time "$pid")" = "$start" ] || return 1
+  state="$(ps -p "$pid" -o stat= 2>/dev/null)"
+  case "$state" in ''|*Z*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+stop_process_tree() {
+  local pid="$1" table="" child="" start="" records="" remaining=0 i=""
+  table="$(ps -axo pid=,ppid= 2>/dev/null)" || return 1
+  for child in $(child_process_ids "$pid" "$table") "$pid"; do
+    start="$(pid_start_time "$child")"
+    [ -n "$start" ] || continue
+    records="$records$child|$start
+"
+  done
+  while IFS='|' read -r child start; do
+    [ -n "$child" ] || continue
+    process_record_alive "$child" "$start" && kill -TERM "$child" 2>/dev/null || true
+  done <<< "$records"
+  for i in $(seq 1 10); do
+    remaining=0
+    while IFS='|' read -r child start; do
+      [ -n "$child" ] || continue
+      process_record_alive "$child" "$start" && remaining=1
+    done <<< "$records"
+    [ "$remaining" = "1" ] || return 0
+    sleep 1
+  done
+  while IFS='|' read -r child start; do
+    [ -n "$child" ] || continue
+    process_record_alive "$child" "$start" && kill -KILL "$child" 2>/dev/null || true
+  done <<< "$records"
+  sleep 1
+  while IFS='|' read -r child start; do
+    [ -n "$child" ] || continue
+    process_record_alive "$child" "$start" && return 1
+  done <<< "$records"
+  return 0
 }
 
 cmd_stop() {
@@ -610,21 +727,11 @@ cmd_stop() {
     return 1
   fi
   info "停止 Web UI ..."
-  kill -TERM "$pid" 2>/dev/null || true
-  local i
-  for i in $(seq 1 10); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
-    sleep 1
-  fi
-  rm -f "$PID_FILE"
-  if kill -0 "$pid" 2>/dev/null; then
-    err "停止失败，进程 $pid 仍在运行"
+  if ! stop_process_tree "$pid"; then
+    err "停止失败，保留 PID 记录以便重试"
     return 1
   fi
+  rm -f "$PID_FILE"
   ok "Web UI 已停止"
   [ "$JSON_OUT" = "1" ] && printf '{"running":false}\n'
   return 0
@@ -696,10 +803,19 @@ cmd_logs() {
   fi
 }
 
+web_open_url() {
+  local authenticated=""
+  if is_running && [ -f "$LOG_FILE" ]; then
+    authenticated="$(sed -n "s|^dsh web: \(http://127\.0\.0\.1:$PORT/?token=[A-Za-z0-9_-]*\)$|\1|p" "$LOG_FILE" | tail -1)"
+  fi
+  [ -z "$authenticated" ] || { printf '%s' "$authenticated"; return 0; }
+  web_url
+}
+
 cmd_open() {
   load_config
   detect_platform
-  local url; url="$(web_url)"
+  local url; url="$(web_open_url)"
   if [ "$OS" = "macos" ] && command -v open >/dev/null 2>&1; then open "$url"
   elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1
   else info "请在浏览器打开: $url"; fi
@@ -726,6 +842,7 @@ install_npx() {
 
 install_source() {
   step "源码安装"
+  INSTALL_DIR="$(absolute_path "$INSTALL_DIR")"
   local repo_url="${CLONE_URL:-$GITHUB_REPO}" cloned_by_installer=0
   if [ -d "$INSTALL_DIR/.git" ] && repo_marker "$INSTALL_DIR"; then
     info "检测到现有仓库 ${INSTALL_DIR}，执行 git pull 更新"
@@ -874,6 +991,12 @@ cmd_install() {
     ok "API Key 已写入 ${env_file}（也可稍后在 Web UI 设置页配置）"
   fi
 
+  # ---- 登记 home，确保后续未设置 DSH_HOME 的终端仍使用同一目录 ----
+  if safe_cleanup_path "$DSH_HOME_DIR"; then
+    mkdir -p "$DSH_HOME_DIR" || die "无法创建 DSH_HOME"
+    : > "$DSH_HOME_DIR/.dsh-installer-home" || die "无法登记 DSH_HOME"
+  fi
+
   # ---- 启动器 / CLI 链接 ----
   write_run_script
   write_launcher
@@ -902,7 +1025,8 @@ write_launcher() {
   {
     echo '#!/usr/bin/env bash'
     echo "# Generated by $APP_NAME $APP_VERSION — do not edit."
-    printf 'export PATH=%s:$PATH\n' "$(shell_quote "$BIN_DIR")"
+    printf 'export PATH=%s:%s:$PATH\n' "$(shell_quote "$DATA_DIR/pnpm/bin")" "$(shell_quote "$BIN_DIR")"
+    printf 'export DSH_HOME=%s\n' "$(shell_quote "$DSH_HOME_DIR")"
     if [ -n "$REGISTRY" ]; then printf 'export npm_config_registry=%s\n' "$(shell_quote "$REGISTRY")"; fi
     printf 'cd %s\n' "$(shell_quote "$run_dir")"
     if [ "${MODE:-npx}" = "npx" ]; then
@@ -1100,7 +1224,7 @@ description: 可选的实验性 DeepSeek Harness 安装、服务与插件管理�
 
 ## 规则
 1. 不要为了自动化而默认追加 `-y`；只有用户明确希望非交互执行时才加。
-2. `uninstall` 默认保留 `~/.dsh` 数据。绝不默认加入 `--purge` 或 `--remove-external`；这两项会删除数据或其他安装，必须单独、再次获得用户确认。
+2. `uninstall` 默认保留已登记的 `DSH_HOME` 数据。可先用 `uninstall --purge --dry-run` 预览。绝不默认加入 `--purge`、`--purge-temp` 或 `--remove-external`；这些选项会删除数据或其他安装，必须单独、再次获得用户确认。
 3. 安装/移除插件后可能需要重启 Web UI 才生效。先说明影响，再按用户指示执行。
 4. 要求 Node.js >= 22.19 或 >=24；缺失时安装器可能安装到用户目录。国内网络失败时可由用户选择 `--registry https://registry.npmmirror.com`。
 5. 失败先查看 **dsh-installer logs -n 30**，不要通过扩大删除范围或放松 pnpm 安全闸门来“修复”。
@@ -1249,104 +1373,171 @@ run_menu() {
 }
 
 # ---------------------------------------------------------------- 卸载
+# 所有删除先展示实际路径；失败保留配置，便于重试。
+cleanup_remove() {
+  local kind="$1" path="$2"
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  if [ "$kind" = "tree" ] && ! safe_cleanup_path "$path"; then
+    warn "保留不安全路径: $path"
+    CLEANUP_FAILED=1
+    return 0
+  fi
+  info "删除: $path"
+  [ "${DRY_RUN:-0}" = "1" ] && return 0
+  if [ "$kind" = "tree" ]; then rm -rf -- "$path"; else rm -f -- "$path"; fi
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    err "删除失败: $path"
+    CLEANUP_FAILED=1
+  fi
+  return 0
+}
+
+cleanup_shell_path() {
+  local rc="" tmp="" expected="export PATH=$(shell_quote "$BIN_DIR"):\$PATH"
+  for rc in "$HOME_DIR/.bashrc" "$HOME_DIR/.zshrc"; do
+    [ -f "$rc" ] && [ ! -L "$rc" ] || continue
+    if grep -Fq '# dsh-installer PATH' "$rc" && grep -Fxq "$expected" "$rc"; then
+      info "移除安装器 PATH 段: $rc"
+      [ "${DRY_RUN:-0}" = "1" ] && continue
+      tmp="$(mktemp "${rc}.dsh-installer.XXXXXX")" || { CLEANUP_FAILED=1; continue; }
+      # 只删除完整匹配的两行，保留用户自己编写的 PATH。
+      awk -v expected="$expected" '
+        pending { if ($0 == expected) { pending=0; next }; print "# dsh-installer PATH"; pending=0 }
+        $0 == "# dsh-installer PATH" { pending=1; next }
+        { print }
+        END { if (pending) print "# dsh-installer PATH" }
+      ' "$rc" > "$tmp"
+      cat "$tmp" > "$rc" || CLEANUP_FAILED=1
+      rm -f -- "$tmp"
+    fi
+  done
+}
+
+# 只检查 Node/npm 启动器的命令行，避免将自身脚本中的字符串当作运行中的 DSH。
+# 0=有实例 1=没有实例 2=无法检查。
+dsh_processes_active() {
+  local listing=""
+  listing="$(ps -axo comm=,args= 2>/dev/null)" || return 2
+  printf '%s\n' "$listing" | awk '
+    $1 ~ /(^|\/)(node|npm|pnpm|npx)$/ &&
+    $0 ~ /apps\/cli\/(src|lib)\/bin\.(ts|js)|@deepseek-ai\/dsh|[ \/]dsh web|deepseek-harness\/packages\// { found=1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+# 最新源码使用的进程临时目录；仅显式 --purge-temp，且没有运行中的 DSH 时处理。
+cleanup_dsh_temp() {
+  local root="" path="" active_rc=0
+  dsh_processes_active || active_rc=$?
+  if [ "$active_rc" != "1" ]; then
+    err "仍有 DSH 进程或无法验证，保留临时目录；停止所有实例后重试"
+    CLEANUP_FAILED=1
+    return
+  fi
+  for root in "${TMPDIR:-/tmp}" /tmp; do
+    [ -d "$root" ] || continue
+    root="$(cd "$root" && pwd -P)" || continue
+    for path in "$root"/dsh-subprocess-launch-* "$root"/dsh-shell-* "$root"/dsh-subprocess-* \
+      "$root"/dsh-spill-* "$root"/dsh-ptc-runtime-python-* "$root"/dsh-native-command-* \
+      "$root"/dsh-acl-skill-* "$root"/dsh-stagehand-chrome-* "$root"/dsh-drops; do
+      [ -d "$path" ] && [ ! -L "$path" ] && [ -O "$path" ] || continue
+      cleanup_remove tree "$path"
+    done
+  done
+}
+
 cmd_uninstall() {
-  local purge=0 extra_dir="" remove_external=0
+  local purge=0 purge_temp=0 extra_dir="" remove_external=0 stop_rc=0 b="" path="" dirty="" commits=""
+  DRY_RUN=0 CLEANUP_FAILED=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --purge) purge=1; shift ;;
+      --purge-temp) purge_temp=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
       --remove-external) remove_external=1; shift ;;
-      -d|--dir) extra_dir="$2"; shift 2 ;;
+      -d|--dir) [ $# -ge 2 ] || die "$1 缺少路径"; extra_dir="$2"; shift 2 ;;
       --dir=*) extra_dir="${1#*=}"; shift ;;
       -y|--yes) YES=1; shift ;;
       -q|--quiet) QUIET=1; shift ;;
+      -h|--help) usage; return 0 ;;
       *) die "未知选项: $1" ;;
     esac
   done
+  [ "$purge_temp" = "0" ] || [ "$purge" = "1" ] || die "--purge-temp 需与 --purge 同用"
   load_config
   [ -n "${MODE:-}" ] || MODE="npx"
-
-  if [ ! -t 0 ] && [ "$YES" != "1" ]; then
-    die "卸载需确认：非交互调用请加 -y"
-  fi
-  if ! confirm "确定卸载本工具安装的 DeepSeek Harness？" "n"; then
-    info "已取消"
-    return 0
-  fi
-
-  info "停止服务 ..."
-  cmd_stop >/dev/null 2>&1 || true
-
-  # ---- 只清理本工具确认拥有的资源（默认不扫、不猜、不扩大范围）----
-  if [ "${MODE:-npx}" = "source" ]; then
-    if [ -d "$INSTALL_DIR" ] && repo_marker "$INSTALL_DIR" && [ -f "$INSTALL_DIR/$SOURCE_MARKER_NAME" ]; then
-      if [ "$INSTALL_DIR" = "/" ] || [ "$INSTALL_DIR" = "$HOME_DIR" ]; then
-        warn "拒绝删除不安全路径: $INSTALL_DIR"
-      elif [ -n "$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null)" ]; then
-        if confirm "源码目录存在未提交改动，仍要删除？" "n"; then
-          rm -rf "$INSTALL_DIR" && ok "已删除源码目录: $INSTALL_DIR"
-        else
-          warn "已跳过源码目录: $INSTALL_DIR"
-        fi
-      else
-        info "删除源码目录: $INSTALL_DIR"
-        rm -rf "$INSTALL_DIR"
-      fi
-    elif [ -d "$INSTALL_DIR" ] && repo_marker "$INSTALL_DIR"; then
-      warn "源码目录缺少本安装器归属标记（可能是用户原有或旧版本安装），为安全起见保留: $INSTALL_DIR"
-    else
-      info "源码目录不存在或非 DSH 仓库，跳过"
-    fi
+  INSTALL_DIR="$(absolute_path "$INSTALL_DIR")"
+  # 删除前完成校验，不在移除源码/配置后才发现 purge 路径无效。
+  [ "$purge" = "0" ] || validate_purge_home
+  safe_cleanup_path "$CFG_DIR" || die "不安全的安装器配置目录: $CFG_DIR"
+  if [ "$DRY_RUN" = "1" ]; then
+    info "预览模式：不会停止进程或删除文件"
   else
-    info "清理 npx 缓存中的 dsh ..."
-    clear_npx_dsh_cache
+    [ -t 0 ] || [ "$YES" = "1" ] || die "卸载需确认：非交互调用请加 -y"
+    confirm "确定卸载本工具安装的 DeepSeek Harness？" "n" || { info "已取消"; return 0; }
+    cmd_stop || stop_rc=$?
+    [ "$stop_rc" = "0" ] || [ "$stop_rc" = "2" ] || die "服务未安全停止，保留安装和数据"
+    local active_rc=0
+    dsh_processes_active || active_rc=$?
+    [ "$active_rc" = "1" ] || die "仍有其他 DSH 实例或无法验证进程，保留安装和数据；先停止所有实例"
   fi
 
-  [ -f "$LAUNCHER" ] && rm -f "$LAUNCHER"
-  [ -L "$CLI_LINK" ] && rm -f "$CLI_LINK"
-  if [ -f "$SKILL_MARKER" ]; then
-    rm -rf -- "$SKILL_DIR"
-  elif [ -d "$SKILL_DIR" ]; then
-    warn "Skill 目录缺少本安装器归属标记，保留: $SKILL_DIR"
-  fi
-  [ -f "$NODE_DIR/.installed-by-dsh-installer" ] && rm -rf "$NODE_DIR"
-  for b in node npm npx corepack; do
-    if [ -L "$BIN_DIR/$b" ] && [ -e "$BIN_DIR/$b" ] && [ "$(readlink "$BIN_DIR/$b" 2>/dev/null)" = "$NODE_DIR/bin/$b" ]; then
-      rm -f "$BIN_DIR/$b"
+  if [ -d "$INSTALL_DIR" ] && repo_marker "$INSTALL_DIR" && [ -f "$INSTALL_DIR/$SOURCE_MARKER_NAME" ]; then
+    dirty="$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null)" || dirty="无法验证仓库状态"
+    commits="$(git -C "$INSTALL_DIR" rev-list --count HEAD --not --remotes 2>/dev/null)" || commits="unknown"
+    if [ -n "$dirty" ] || [ "$commits" != "0" ]; then
+      if [ "$DRY_RUN" = "0" ] && confirm_external_removal "源码含本地改动/提交或无法验证，仍删除 $INSTALL_DIR？"; then
+        cleanup_remove tree "$INSTALL_DIR"
+      else
+        warn "保留源码（本地改动/提交或无法验证）: $INSTALL_DIR"
+        CLEANUP_FAILED=1
+      fi
+    else
+      cleanup_remove tree "$INSTALL_DIR"
     fi
+  elif [ "${MODE:-}" = "source" ] && [ -d "$INSTALL_DIR" ]; then
+    warn "保留外部源码: $INSTALL_DIR；可用 --remove-external 单独确认清理"
+  fi
+  # 两种模式都可能留下 DSH 的 npx 缓存，在删除私有 Node 前定位并清理。
+  clear_npx_dsh_cache || CLEANUP_FAILED=1
+  if [ -f "$LAUNCHER" ] && grep -Fq "# Generated by $APP_NAME " "$LAUNCHER"; then cleanup_remove file "$LAUNCHER"; fi
+  if [ -L "$CLI_LINK" ] && [ "$(readlink "$CLI_LINK")" = "$SCRIPT_PATH" ]; then cleanup_remove file "$CLI_LINK"; fi
+  [ ! -f "$SKILL_MARKER" ] || cleanup_remove tree "$SKILL_DIR"
+  for b in node npm npx corepack; do
+    # -L 也识别失效链接，必须在删除 Node 前检查。
+    path="$BIN_DIR/$b"
+    if [ -L "$path" ] && [ "$(readlink "$path")" = "$NODE_DIR/bin/$b" ]; then cleanup_remove file "$path"; fi
   done
-  rm -rf "$CFG_DIR"
-  rmdir "$BIN_DIR" 2>/dev/null || true
+  [ ! -f "$NODE_DIR/.installed-by-dsh-installer" ] || cleanup_remove tree "$NODE_DIR"
+  [ ! -f "$DATA_DIR/pnpm/.installed-by-dsh-installer" ] || cleanup_remove tree "$DATA_DIR/pnpm"
+  cleanup_shell_path
 
   if [ "$purge" = "1" ]; then
-    if [ "$DSH_HOME_DIR" = "$HOME_DIR" ] || [ "$DSH_HOME_DIR" = "/" ] || [ "${DSH_HOME_DIR##*/}" != ".dsh" ]; then
-      die "拒绝删除不安全路径: ${DSH_HOME_DIR}（--purge 仅允许删除 ~/.dsh 形态的数据目录）"
-    fi
-    if confirm "同时删除全部数据目录 ${DSH_HOME_DIR}（会话、配置、插件全部丢失）？" "n"; then
-      rm -rf "$DSH_HOME_DIR"
-      ok "已删除数据目录"
+    if [ "$DRY_RUN" = "1" ] || confirm "删除 $DSH_HOME_DIR 的会话、凭据、插件、附件及运行时缓存？" "n"; then
+      cleanup_remove tree "$DSH_HOME_DIR"
     else
-      info "保留数据目录: $DSH_HOME_DIR"
+      warn "保留数据目录: $DSH_HOME_DIR"
     fi
+  else
+    info "保留数据目录: $DSH_HOME_DIR（--purge 可清理）"
   fi
-
-  ok "卸载完成"
-  [ "$purge" = "1" ] || info "提示: 数据目录 $DSH_HOME_DIR 已保留，如需彻底删除请用 --purge"
-  if [ "${MODE:-npx}" = "npx" ]; then
-    info "说明: npx 模式无驻留安装，npx @deepseek-ai/dsh web 本身随时可再次运行（已清理缓存/启动器/技能）"
+  [ "$purge_temp" = "0" ] || cleanup_dsh_temp
+  if [ "$remove_external" = "1" ]; then cmd_remove_external "$extra_dir" || CLEANUP_FAILED=1; fi
+  # 不递归删除配置目录里的未知文件或不属于安装器的 Node。
+  if [ "$CLEANUP_FAILED" = "0" ]; then
+    for path in "$RUN_SCRIPT" "$PID_FILE" "$LOG_FILE" "$CONFIG_FILE"; do cleanup_remove file "$path"; done
   fi
-
-  # 外部安装清理是独立的危险操作，默认不执行
-  if [ "$remove_external" = "1" ]; then
-    cmd_remove_external "$extra_dir"
-  elif [ -n "$extra_dir" ]; then
-    warn "提示: --dir 仅在 --remove-external 时生效"
+  if [ "$DRY_RUN" = "0" ]; then
+    rmdir "$CFG_DIR" "$DATA_DIR" 2>/dev/null || true
   fi
+  [ "$CLEANUP_FAILED" = "0" ] || { err "清理未完成，已保留配置；检查以上保留/失败项后重试"; return 1; }
+  if [ "$DRY_RUN" = "1" ]; then ok "预览结束"; else ok "卸载完成"; fi
 }
 
 # 扫描并清理外部安装（独立危险操作：先展示清单，默认取消）
 safe_external_source_repo() {
   local path="$1" origin="" dirty="" local_commits=""
-  if [ "$path" = "/" ] || [ "$path" = "$HOME_DIR" ]; then
+  if ! safe_cleanup_path "$path"; then
     warn "拒绝删除不安全路径: $path"
     return 1
   fi
@@ -1359,7 +1550,7 @@ safe_external_source_repo() {
     https://github.com/deepseek-ai/deepseek-harness|https://github.com/deepseek-ai/deepseek-harness.git|git@github.com:deepseek-ai/deepseek-harness.git|git@github.com:deepseek-ai/deepseek-harness|ssh://git@github.com/deepseek-ai/deepseek-harness.git) ;;
     *) warn "仓库 origin 非官方地址，保留: $path"; return 1 ;;
   esac
-  dirty="$(git -C "$path" status --porcelain 2>/dev/null || true)"
+  dirty="$(git -C "$path" status --porcelain 2>/dev/null)" || { warn "无法验证仓库状态，保留: $path"; return 1; }
   if [ -n "$dirty" ]; then
     warn "仓库有未提交改动，保留: $path"
     return 1
@@ -1390,35 +1581,65 @@ cmd_remove_external() {
   warn "以下为本工具之外的安装（先展示清单，默认不删除）:"
   printf '%s\n' "$found" | sed 's/^/    /'
   echo
+  if [ "${DRY_RUN:-0}" = "1" ]; then return 0; fi
+  local active_rc=0
+  dsh_processes_active || active_rc=$?
+  [ "$active_rc" = "1" ] || { err "仍有 DSH 实例或无法验证进程，拒绝清理外部安装"; return 1; }
   if ! confirm_external_removal "确认清理以上全部外部安装？"; then
     info "已取消（核对清单后再执行）"
-    return 0
+    return 1
   fi
   # 原生卸载（确认之后才执行）
   if command -v npm >/dev/null 2>&1; then npm uninstall -g "$NPX_PKG" >/dev/null 2>&1 || true; fi
   if command -v pnpm >/dev/null 2>&1; then pnpm uninstall -g "$NPX_PKG" >/dev/null 2>&1 || true; fi
   if command -v yarn >/dev/null 2>&1; then yarn global remove "$NPX_PKG" >/dev/null 2>&1 || true; fi
   # 删除剩余候选
-  printf '%s\n' "$found" | while IFS= read -r line; do
+  while IFS= read -r line; do
     [ -n "$line" ] || continue
     type="${line%%:*}"; path="${line#*:}"
     case "$type" in
       global)
-        [ -d "$path" ] && rm -rf "$path" && ok "已删除全局安装: $path"
+        if [ -L "$path" ]; then
+          cleanup_remove file "$path"
+        elif [ -f "$path/package.json" ] && grep -q '"name"[[:space:]]*:[[:space:]]*"@deepseek-ai/dsh"' "$path/package.json"; then
+          cleanup_remove tree "$path"
+        elif [ -e "$path" ]; then
+          warn "无法确认包归属，保留: $path"; CLEANUP_FAILED=1
+        fi
         ;;
       repo)
         if safe_external_source_repo "$path"; then
-          rm -rf "$path" && ok "已删除源码仓库: $path"
+          cleanup_remove tree "$path"
+        else
+          CLEANUP_FAILED=1
         fi
         ;;
     esac
-  done
+  done <<< "$found"
   # 只清理能证明归属的 dsh shim
   cleanup_owned_shims
   if command -v dsh >/dev/null 2>&1; then
     warn "PATH 中仍存在 dsh 命令: $(command -v dsh)（如仍存在请手动处理）"
   fi
+  [ "${CLEANUP_FAILED:-0}" = "0" ] || return 1
   ok "外部安装清理流程结束"
+}
+
+cmd_external() {
+  local extra_dir=""
+  DRY_RUN=0 CLEANUP_FAILED=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      -d|--dir) [ $# -ge 2 ] || die "$1 缺少路径"; extra_dir="$2"; shift 2 ;;
+      --dir=*) extra_dir="${1#*=}"; shift ;;
+      -y|--yes) YES=1; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "未知选项: $1" ;;
+    esac
+  done
+  load_config
+  cmd_remove_external "$extra_dir"
 }
 
 # ---------------------------------------------------------------- 帮助
@@ -1441,7 +1662,7 @@ DeepSeek Harness 多平台安装器 (macOS / Linux)
   info         查看环境与安装信息（--json）
   open         在浏览器打开 Web UI
   skill        注册可选实验性 dsh Skill（未经完整测试；默认不注册）
-  uninstall    卸载本工具安装的 DSH（--purge 删数据；--remove-external 清理外部安装）
+  uninstall    卸载本工具安装的 DSH（--purge 删数据；--dry-run 预览；--purge-temp 清临时残留）
   remove-external  扫描并清理外部安装（独立危险操作，先展示清单默认取消）
   version      显示版本号
 
@@ -1488,11 +1709,11 @@ main() {
     open) cmd_open ;;
     skill) cmd_skill ;;
     uninstall) cmd_uninstall "$@" ;;
-    remove-external) cmd_remove_external ;;
+    remove-external) cmd_external "$@" ;;
     version|-V|--version) echo "$APP_VERSION" ;;
     -h|--help|help|"") usage ;;
     *) usage >&2; exit 1 ;;
   esac
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

@@ -2,7 +2,7 @@
 
 一套面向 **macOS / Linux / Windows** 的 DeepSeek Harness（`dsh`）安装与管理工具，支持两种官方安装方式，并附带服务管理、插件安装/卸载、更新，以及一个可选的实验性 dsh Skill。
 
-> DeepSeek Harness 目前处于开发者预览阶段，兼容性破坏性变更随时可能发生。
+> utility v1.3.0 对照官方 `0.2.0-rc.2`（源码提交 `639ed015397290b3745d163aafe02ffee4aa3f84`）适配。DeepSeek Harness 目前处于开发者预览阶段，后续版本可能有破坏性变更。
 
 ## 特性
 
@@ -11,10 +11,10 @@
   2. **源码模式** — `git clone https://github.com/deepseek-ai/deepseek-harness.git` + `pnpm install` + `pnpm run build`，适合读改源码；已有仓库会被复用并尝试 `git pull`，但不会被默认卸载流程删除。
 - **服务管理**：后台启动 / 停止 / 重启 / 状态 / 日志 / 浏览器打开，Web UI 默认 http://127.0.0.1:3080。
 - **插件管理**：安装、移除、更新、列表、搜索 dsh 插件（底层转发 `dsh plugin --profile web`，支持 npm 包名、`github:用户/仓库`、本地路径、tarball）。
-- **依赖自动处理**：Node.js（要求 ^22.19.0 或 >=24.0.0）、pnpm、git 缺失时自动安装到用户目录，**全程无需 sudo / 管理员权限**。
+- **依赖自动处理**：Node.js（要求 ^22.19.0 或 >=24.0.0）和 pnpm 缺失时安装到带归属标记的私有用户目录，不修改系统 Node 或 npm 全局 prefix。源码构建还需要 git 和本机编译工具链；缺失时会给出安装提示。
 - **可选实验性 Skill**：无 TTY 自动非交互、`-y` 显式非交互、`--json` 机器可读输出、稳定退出码（0=成功 1=错误 2=未运行）；**安装时不会默认注册或注入 Skill**。仅在用户明确需要时手动执行 `skill` 注册，且该功能未经完整测试。
 - **国内网络友好**：`--registry` 指定 npm 镜像、`--clone-url` 指定 git 镜像；`--api-key` 一键写入 `~/.dsh/.env`。
-- **安全卸载**：卸载前多重守卫（目录/进程归属校验、交互确认），`--purge` 可连 `~/.dsh` 数据目录一并清除；外部安装清理始终要求真实交互终端中的二次确认。
+- **安全卸载**：卸载前多重守卫（目录/进程归属校验、交互确认），`--purge` 删除已登记的 `DSH_HOME`，`--purge-temp` 额外清理本用户的已知 DSH 临时残留，`--dry-run` 先预览实际路径；外部安装清理始终要求真实交互终端中的二次确认。
 
 ## 文件
 
@@ -94,7 +94,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 install -y --mod
 ./install.sh restart        # 重启
 ./install.sh status         # 状态；加 --json 输出机器可读结果
 ./install.sh logs -n 50     # 查看日志；-f 持续输出
-./install.sh open           # 在浏览器打开 Web UI
+./install.sh open           # 使用当前启动日志中的认证 URL 打开 Web UI
 ```
 
 ### 插件管理（profile 默认为 web）
@@ -124,7 +124,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 install -y --mod
 ```sh
 ./install.sh update -y              # npx 模式清缓存（下次启动即最新）；源码模式 git pull + 重建
 ./install.sh uninstall -y           # 卸载本体（保留 ~/.dsh 数据）
-./install.sh uninstall -y --purge   # 连同 ~/.dsh（会话/配置/插件）全部删除
+./install.sh uninstall --purge --dry-run    # 先预览，既不停止进程也不删除文件
+./install.sh uninstall -y --purge          # 删除本体和已登记的 DSH_HOME
+./install.sh uninstall -y --purge --purge-temp  # 加上本用户已知 DSH 临时残留
+./install.sh remove-external --dry-run  # 预览外部安装
 ./install.sh remove-external        # 扫描并清理外部安装（独立危险操作；必须人工二次确认）
 ./install.sh uninstall -y --remove-external --dir ~/my-fork/deepseek-harness  # 组合使用；仍必须人工二次确认
 ```
@@ -133,18 +136,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 install -y --mod
 
 | 层级 | 内容 | 触发方式 |
 | --- | --- | --- |
-| ① 本工具管理的资源 | 带本安装器归属标记的源码目录（脏仓库二次确认）、启动器、CLI 链接、带归属标记的可选 Skill、本工具安装的 Node、仅 DSH 自身的 npx 缓存条目 | `uninstall`（默认） |
-| ② 数据目录 | `~/.dsh`（会话/配置/插件） | `uninstall --purge`（二次确认，仅限名为 .dsh 的目录） |
+| ① 本工具管理的资源 | 带归属标记的源码目录、启动器、CLI 链接、可选 Skill、私有 Node/pnpm、DSH npx 缓存及本工具写入的 PATH 段；源码若有本地改动/未推送提交，`-y` 不能绕过人工确认 | `uninstall`（默认） |
+| ② 数据目录 | 已登记的 `DSH_HOME`，默认 `~/.dsh`：会话、凭据、设置、profiles/插件、附件、`cache` 下的运行时缓存 | `uninstall --purge`；自定义目录需有安装器 home 标记或官方 profiles 目录，系统根/用户目录/符号链接及 junction 路径会拒绝删除 |
 | ③ 外部安装 | `npm install -g`、`pnpm add -g`、`yarn global add`、nvm/fnm/volta 各版本全局装、常见位置的源码仓库 | `remove-external`（先展示清单，**无论是否带 `-y` 都必须人工二次确认**；源码仓库仅当官方 origin、无未提交改动且无仅本地提交时才删除；shim 只删能证明指向 `@deepseek-ai/dsh` 的） |
+
+| ④ 临时残留 | 系统临时目录中本用户拥有的 `dsh-spill-*`、`dsh-subprocess-*`、`dsh-subprocess-launch-*`、`dsh-shell-*`、`dsh-ptc-runtime-python-*`、`dsh-native-command-*`、`dsh-acl-skill-*`、`dsh-stagehand-chrome-*`、`dsh-drops` | `uninstall --purge --purge-temp`；须没有运行中的 DSH，跳过 symlink/junction 和其他用户目录 |
+
+`--dry-run` 可与所有卸载选项组合，打印将处理的路径，不停止服务、不删文件、不改 PATH。服务停止失败、发现其他运行中的 DSH 或无法检查进程时会在删除前退出；删除失败或源码被保护而跳过时返回 1，保留安装器配置供重试。未知配置文件、共享 Node/pnpm、其他 npm 缓存、pnpm store、工作区中的产物、系统安装的 git、浏览器 localStorage/cookie 不属于这一清理范围。
 
 说明：npx 模式本身无驻留安装，`npx @deepseek-ai/dsh web` 随时可以重新下载运行——默认卸载的意义在于清除 DSH 自己的缓存条目、启动器和带归属标记的可选 Skill；数据目录仅在明确指定 `--purge` 后才会处理。
 
 ### 参数约束与安全
 
-- `--host` 仅接受 `127.0.0.1` 或 `0.0.0.0`；选 `0.0.0.0` 会强弹警告（Web UI 当前无 TLS/认证，暴露到局域网有风险）。
+- `--host` 仅接受 `127.0.0.1` 或 `0.0.0.0`；选 `0.0.0.0` 会强弹警告（Web UI 无 TLS；最新版有进程访问令牌，启动日志和认证 URL 应妥善保管）。
 - `--port` 仅接受 1-65535（不接受 0）。
 - `--registry` / `--clone-url` 会被校验；shell 版不再把这些值或插件参数拼接进 `sh -c`。
-- 进程管理带身份校验：PID 文件记录 PID、启动时间和命令行特征。旧版本仅含 PID 的记录只用于诊断，绝不会被当成可停止的本工具进程；端口探测只用于「被占用」提示，不作为身份认证。
+- 进程管理带身份校验：PID 文件记录 PID、启动时间和命令行特征。旧版本仅含 PID 的记录只用于诊断，绝不会被当成可停止的本工具进程；端口探测只用于「被占用」提示，不作为身份认证。macOS/Linux 停止时按 PPID 快照处理后代进程，并逐个核对启动时间；Windows 使用 `taskkill /T`。
 - `npx` 的缓存目录是共享目录；更新和默认卸载只清理确认含 `@deepseek-ai/dsh` 的缓存条目，不会删除整个 `_npx` 缓存。
 
 ### 其他
@@ -177,10 +184,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 install -y --mod
 
 | 位置 | 内容 |
 | --- | --- |
-| `~/.dsh` | DSH 数据目录：profiles（含 web 插件）、会话、设置、技能（`DSH_HOME` 可覆盖） |
+| `~/.dsh` 或自定义 `DSH_HOME` | DSH 数据目录；安装器会将绝对路径存入配置并传给启动器，后续显式设置 DSH_HOME 可覆盖已存值 |
 | `~/.dsh/.env` | `DEEPSEEK_API_KEY` 等凭据（安装器 `--api-key` 写入处） |
 | `~/.config/dsh-installer`（macOS/Linux）/ `%LOCALAPPDATA%\dsh-installer`（Windows） | 安装器配置、pid、日志 |
 | `~/.local/share/dsh-installer/node`（macOS/Linux） | 安装器自动安装的 Node（有标记文件，卸载时随之删除） |
+| `~/.local/share/dsh-installer/pnpm`（macOS/Linux）/ `%LOCALAPPDATA%\dsh-installer\pnpm`（Windows） | 缺失 pnpm 时的私有安装，默认卸载会一并删除 |
 | `~/deepseek-harness` | 源码模式的仓库（默认位置） |
 
 ## 常见问题
@@ -195,7 +203,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 install -y --mod
 加 `--registry https://registry.npmmirror.com`；源码模式再加 `--clone-url` 指向镜像。
 
 **Q: 卸载会误删其他文件吗？**
-默认流程不会扩大到未经证明归属的资源。`uninstall` 只清理带本安装器归属标记的源码目录、Skill、本工具安装的 Node、启动器和 DSH 自己的 npx 缓存条目；`--purge` 仅允许删除名为 `.dsh` 的数据目录且需二次确认；外部安装必须显式 `remove-external`，先展示清单，且即使带 `-y` 也必须人工二次确认。
+默认流程不会扩大到未经证明归属的资源。`uninstall` 只清理带本安装器归属标记的源码目录、Skill、本工具安装的 Node、启动器和 DSH 自己的 npx 缓存条目；`--purge` 清理已登记且路径校验通过的 DSH_HOME，包括自定义目录；外部安装必须显式 `remove-external`，先展示清单，且即使带 `-y` 也必须人工二次确认。
 
 **Q: 能卸载不是用本安装器装的 dsh 吗？**
 可以，但默认**不会碰**。用 `remove-external`（或 `uninstall --remove-external`）先展示候选清单；它必须从真实交互终端输入 `y/yes`，`-y` 不能绕过该确认。确认后才执行 `npm uninstall -g`、`pnpm uninstall -g`、`yarn global remove` 并清理扫描到的包；源码仓库还必须同时满足官方 origin、无未提交改动、无仅本地提交，`--dir` 只能额外提供候选目录，不能跳过这些条件。
@@ -207,7 +215,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 install -y --mod
 把 `~/.local/bin` 加入 PATH（见快速开始）；Windows 用户 PATH 已在安装时写入，新开终端生效。
 
 **Q: pnpm 版本？**
-官方仓库锁定 pnpm 11.7.0；安装器按此版本安装，已有其他版本亦可使用。
+此版本官方仓库声明 pnpm 11.7.0；缺失时安装器安装这个版本到私有目录，已有 pnpm 会复用。源码安装后由仓库自身的 packageManager/锁文件约束依赖。
+
+## 验证与平台支持
+
+脚本支持 macOS/Linux（Bash 3.2+，x64/arm64）和 Windows（PowerShell 5.1+，x64/arm64）。Linux 已执行官方 rc.2 的源码安装/构建和 Web 启动、认证访问、停止、清理集成检查。PowerShell 的通用清理逻辑可在 Linux 上运行回归；Windows CMD、junction、CIM/ACL、macOS 系统 Bash 的原生验证由 `.github/workflows/cleanup.yml` 平台矩阵执行，架构支持不代表所有 CPU 都已实机测试。
+
+```sh
+python -m unittest discover -s tests -v  # macOS/Linux 隔离目录回归
+pwsh -NoProfile -File tests/cleanup.ps1 # PowerShell 通用回归；Windows 增加 CMD/junction 检查
+```
+
+测试覆盖完整清理、自定义 home、只读预览、共享缓存保留、失效链接、本地提交/改动保护、停止失败和进程树停止。测试不修改真实 HOME，也不清理真实安装。
 
 ## 免责声明
 
