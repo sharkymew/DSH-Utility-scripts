@@ -67,7 +67,33 @@ class CleanupTest(unittest.TestCase):
         git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'initial')
         git('update-ref', 'refs/remotes/origin/main', 'HEAD')
         (self.source / '.git' / 'dsh-installer-owned').touch()
+        self.set_mode('source')
         return git
+
+    def set_mode(self, mode):
+        (self.cfg / 'config').write_text('MODE=' + mode + '\nDSH_HOME_DIR=' + str(self.dsh) + '\n')
+
+    def hidden_local_work(self, kind):
+        git = self.source_repo()
+        base = subprocess.run(['git', '-C', str(self.source), 'rev-parse', 'HEAD'],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        if kind == 'branch':
+            git('checkout', '-b', 'unpublished-feature')
+            (self.source / 'user.txt').write_text('unpublished work')
+            git('add', '.')
+            git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'feature')
+            git('checkout', '--detach', base)
+        else:
+            (self.source / 'package.json').write_text('{"name": "@deepseek-ai/dsh-root", "privateWork": true}\n')
+            git('stash', 'push', '-m', 'unpublished work')
+        return git
+
+    def assert_hidden_work_preserved(self, kind, mode):
+        self.hidden_local_work(kind)
+        self.set_mode(mode)
+        self.run_script('cmd_uninstall -y', 1)
+        self.assertTrue(self.source.exists(), 'Deleted unpublished ' + kind)
+        self.assertTrue((self.cfg / 'config').exists(), 'Lost retry configuration')
 
     def test_dry_run_preserves_every_file(self):
         entry = self.cache_entry('owned')
@@ -128,6 +154,30 @@ class CleanupTest(unittest.TestCase):
         git('add', '.')
         git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'local')
         self.run_script('MODE=source; cmd_uninstall -y', 1)
+        self.assertTrue(self.source.exists())
+
+    def test_other_local_branch_preserved_in_source_mode(self):
+        self.assert_hidden_work_preserved('branch', 'source')
+
+    def test_other_local_branch_preserved_after_switch_to_npx(self):
+        self.assert_hidden_work_preserved('branch', 'npx')
+
+    def test_stash_preserved_in_source_mode(self):
+        self.assert_hidden_work_preserved('stash', 'source')
+
+    def test_stash_preserved_after_switch_to_npx(self):
+        self.assert_hidden_work_preserved('stash', 'npx')
+
+    def test_external_source_with_other_local_branch_is_rejected(self):
+        git = self.hidden_local_work('branch')
+        git('remote', 'add', 'origin', 'https://github.com/deepseek-ai/deepseek-harness.git')
+        self.run_script('safe_external_source_repo "$INSTALL_DIR"', 1)
+        self.assertTrue(self.source.exists())
+
+    def test_external_source_with_stash_is_rejected(self):
+        git = self.hidden_local_work('stash')
+        git('remote', 'add', 'origin', 'https://github.com/deepseek-ai/deepseek-harness.git')
+        self.run_script('safe_external_source_repo "$INSTALL_DIR"', 1)
         self.assertTrue(self.source.exists())
 
     def test_stop_failure_aborts_before_deletion(self):

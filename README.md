@@ -226,7 +226,9 @@ python -m unittest discover -s tests -v  # macOS/Linux 隔离目录回归
 pwsh -NoProfile -File tests/cleanup.ps1 # PowerShell 通用回归；Windows 增加 CMD/junction 检查
 ```
 
-测试覆盖完整清理、自定义 home、只读预览、共享缓存保留、失效链接、本地提交/改动保护、停止失败和进程树停止。测试不修改真实 HOME，也不清理真实安装。
+测试覆盖完整清理、自定义 home、只读预览、共享缓存保留、失效链接、本地提交/改动保护（包括其他本地分支和 stash）、停止失败和进程树停止。Windows 回归还覆盖 npm 路径分隔符、私有 Node 优先级和 v1.2 启动器的兼容识别。无法确认归属的旧启动器仍会保留。
+
+这些回归使用隔离目录、样例仓库和受控进程信息，不修改真实 HOME，也不清理真实安装；它们不等同于所有平台、所有架构上的完整安装集成测试。
 
 ## 免责声明
 

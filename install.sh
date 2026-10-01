@@ -1484,7 +1484,8 @@ cmd_uninstall() {
 
   if [ -d "$INSTALL_DIR" ] && repo_marker "$INSTALL_DIR" && [ -f "$INSTALL_DIR/$SOURCE_MARKER_NAME" ]; then
     dirty="$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null)" || dirty="无法验证仓库状态"
-    commits="$(git -C "$INSTALL_DIR" rev-list --count HEAD --not --remotes 2>/dev/null)" || commits="unknown"
+    # Include every local branch/tag and refs/stash, not only the checked-out HEAD.
+    commits="$(git -C "$INSTALL_DIR" rev-list --count --all --not --remotes 2>/dev/null)" || commits="unknown"
     if [ -n "$dirty" ] || [ "$commits" != "0" ]; then
       if [ "$DRY_RUN" = "0" ] && confirm_external_removal "源码含本地改动/提交或无法验证，仍删除 ${INSTALL_DIR}？"; then
         cleanup_remove tree "$INSTALL_DIR"
@@ -1555,7 +1556,7 @@ safe_external_source_repo() {
     warn "仓库有未提交改动，保留: $path"
     return 1
   fi
-  local_commits="$(git -C "$path" rev-list --count HEAD --not --remotes 2>/dev/null || true)"
+  local_commits="$(git -C "$path" rev-list --count --all --not --remotes 2>/dev/null || true)"
   case "$local_commits" in
     ''|*[!0-9]*) warn "无法验证是否含仅本地提交，保留: $path"; return 1 ;;
   esac
