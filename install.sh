@@ -292,7 +292,7 @@ install_node_local() {
     rm -rf -- "$NODE_DIR"
   elif [ -e "$NODE_DIR" ]; then
     rm -rf -- "$tmp"
-    die "检测到已存在的非本安装器 Node 目录: $NODE_DIR，拒绝覆盖"
+    die "检测到已存在的非本安装器 Node 目录: ${NODE_DIR}，拒绝覆盖"
   fi
   if [ "$ext" = "tar.xz" ]; then tar -xJf "$tmp/$file" -C "$tmp"; else tar -xzf "$tmp/$file" -C "$tmp"; fi
   mv "$tmp/node-v$latest-"* "$NODE_DIR"
@@ -1486,7 +1486,7 @@ cmd_uninstall() {
     dirty="$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null)" || dirty="无法验证仓库状态"
     commits="$(git -C "$INSTALL_DIR" rev-list --count HEAD --not --remotes 2>/dev/null)" || commits="unknown"
     if [ -n "$dirty" ] || [ "$commits" != "0" ]; then
-      if [ "$DRY_RUN" = "0" ] && confirm_external_removal "源码含本地改动/提交或无法验证，仍删除 $INSTALL_DIR？"; then
+      if [ "$DRY_RUN" = "0" ] && confirm_external_removal "源码含本地改动/提交或无法验证，仍删除 ${INSTALL_DIR}？"; then
         cleanup_remove tree "$INSTALL_DIR"
       else
         warn "保留源码（本地改动/提交或无法验证）: $INSTALL_DIR"
@@ -1496,7 +1496,7 @@ cmd_uninstall() {
       cleanup_remove tree "$INSTALL_DIR"
     fi
   elif [ "${MODE:-}" = "source" ] && [ -d "$INSTALL_DIR" ]; then
-    warn "保留外部源码: $INSTALL_DIR；可用 --remove-external 单独确认清理"
+    warn "保留外部源码: ${INSTALL_DIR}；可用 --remove-external 单独确认清理"
   fi
   # 两种模式都可能留下 DSH 的 npx 缓存，在删除私有 Node 前定位并清理。
   clear_npx_dsh_cache || CLEANUP_FAILED=1
@@ -1519,7 +1519,7 @@ cmd_uninstall() {
       warn "保留数据目录: $DSH_HOME_DIR"
     fi
   else
-    info "保留数据目录: $DSH_HOME_DIR（--purge 可清理）"
+    info "保留数据目录: ${DSH_HOME_DIR}（--purge 可清理）"
   fi
   [ "$purge_temp" = "0" ] || cleanup_dsh_temp
   if [ "$remove_external" = "1" ]; then cmd_remove_external "$extra_dir" || CLEANUP_FAILED=1; fi
