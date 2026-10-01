@@ -43,8 +43,11 @@ class CleanupTest(unittest.TestCase):
     def run_script(self, script, expected=0):
         env = os.environ.copy()
         env.pop('DSH_HOME', None)
-        result = subprocess.run([os.environ.get('DSH_TEST_BASH', 'bash'), '-c', self.prolog + script], env=env,
-                                text=True, capture_output=True, timeout=15)
+        try:
+            result = subprocess.run([os.environ.get('DSH_TEST_BASH', 'bash'), '-c', self.prolog + script], env=env,
+                                    text=True, capture_output=True, timeout=15)
+        except UnicodeDecodeError as error:
+            raise AssertionError('Shell emitted invalid UTF-8: ' + repr(error.object)) from error
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
 

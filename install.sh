@@ -561,7 +561,7 @@ port_open() {
 
 web_url() { echo "http://$HOST:$PORT"; }
 
-ps_cmdline() { ps -p "$1" -o command= 2>/dev/null | head -1; }
+ps_cmdline() { ps -ww -p "$1" -o command= 2>/dev/null | head -1; }
 
 # 严格身份校验用于 status/start/stop。旧的仅 PID 记录只能诊断，不能视为本工具进程。
 pid_start_time() { ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | head -1; }
@@ -1417,8 +1417,8 @@ cleanup_shell_path() {
 # 0=有实例 1=没有实例 2=无法检查。
 dsh_processes_active() {
   local listing=""
-  listing="$(ps -axo comm=,args= 2>/dev/null)" || return 2
-  printf '%s\n' "$listing" | awk '
+  listing="$(LC_ALL=C ps -axww -o comm=,args= 2>/dev/null)" || return 2
+  printf '%s\n' "$listing" | LC_ALL=C awk '
     $1 ~ /(^|\/)(node|npm|pnpm|npx)$/ &&
     $0 ~ /apps\/cli\/(src|lib)\/bin\.(ts|js)|@deepseek-ai\/dsh|[ \/]dsh web|deepseek-harness\/packages\// { found=1 }
     END { exit(found ? 0 : 1) }
