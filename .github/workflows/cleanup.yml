@@ -1,0 +1,50 @@
+name: Utility cleanup
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Parse standalone Bash installer
+        run: /bin/bash -n install.sh
+      - name: Cleanup and process regressions (system Bash, including macOS 3.2)
+        env:
+          DSH_TEST_BASH: /bin/bash
+        run: python -m unittest discover -s tests -v
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse standalone PowerShell installer
+        shell: powershell
+        run: |
+          $errors = $null; $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'install.ps1'), [ref]$tokens, [ref]$errors) > $null
+          if ($errors.Count) { $errors; exit 1 }
+      - name: Cleanup, Unicode CMD, and junction regressions
+        shell: powershell
+        run: '& ./tests/cleanup.ps1'
+  windows-pwsh:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse standalone PowerShell installer
+        shell: pwsh
+        run: |
+          $errors = $null; $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'install.ps1'), [ref]$tokens, [ref]$errors) > $null
+          if ($errors.Count) { $errors; exit 1 }
+      - name: Cleanup, Unicode CMD, and junction regressions
+        shell: pwsh
+        run: '& ./tests/cleanup.ps1'

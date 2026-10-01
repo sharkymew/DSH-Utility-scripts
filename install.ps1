@@ -16,7 +16,7 @@
 #    info         查看环境与安装信息（支持 --json）
 #    open         在浏览器打开 Web UI
 #    skill        可选注册 dsh 技能（实验性，未经完整测试）
-#    uninstall    卸载（--purge 同时删除 ~/.dsh 数据目录）
+#    uninstall    卸载（--purge 删除 DSH_HOME；--dry-run 预览；--purge-temp 清临时残留）
 #    version      显示版本号
 #
 #  设计目标: 无交互会话时自动非交互（可被 dsh/CI 直接调用），--json 输出
@@ -30,7 +30,7 @@ $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------- 常量
 $script:AppName = "dsh-installer"
-$script:AppVersion = "1.2.0"
+$script:AppVersion = "1.3.0"
 $script:NpxPkg = "@deepseek-ai/dsh"
 $script:GithubRepo = "https://github.com/deepseek-ai/deepseek-harness.git"
 $script:DefaultNodeMajor = "24"
@@ -55,7 +55,8 @@ $script:RunScript = Join-Path $CfgDir "run-web.cmd"
 $script:Launcher = Join-Path $BinDir "dsh-web.cmd"
 $script:CliLink = Join-Path $BinDir "dsh-installer.cmd"
 $script:NodeDir = Join-Path $CfgDir "node"
-if ($env:DSH_HOME) { $script:DshHome = $env:DSH_HOME }
+$script:DshHomeOverride = $env:DSH_HOME
+if (-not [string]::IsNullOrWhiteSpace($env:DSH_HOME)) { $script:DshHome = $env:DSH_HOME }
 else { $script:DshHome = Join-Path $HomeDir ".dsh" }
 $script:SkillDir = Join-Path $DshHome "skills/dsh-installer"
 $script:SkillMarker = Join-Path $SkillDir ".installed-by-dsh-installer"
@@ -138,6 +139,19 @@ function Add-ToUserPath([string]$dir) {
     if (-not $u) { $u = "" }
     $env:Path = $m + ";" + $u
   }
+  Use-PrivateRuntimes
+}
+
+function Use-PrivateRuntimes {
+  $privatePaths = @(@($NodeDir, (Join-Path $CfgDir "pnpm")) | Where-Object {
+    Test-Path -LiteralPath (Join-Path $_ ".installed-by-dsh-installer")
+  })
+  if (-not $privatePaths.Count) { return }
+  $separator = [string][IO.Path]::PathSeparator
+  $otherPaths = @($env:Path -split [regex]::Escape($separator) | Where-Object {
+    $privatePaths -inotcontains $_.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  })
+  $env:Path = (@($privatePaths) + $otherPaths) -join $separator
 }
 
 function Get-ExeName([string]$base) {
@@ -152,6 +166,55 @@ function Get-Arch {
   return "x64"
 }
 
+function ConvertTo-AbsolutePath([string]$path) {
+  if ($path -eq "~") { $path = $HomeDir }
+  elseif ($path.StartsWith("~/") -or $path.StartsWith("~\")) { $path = Join-Path $HomeDir $path.Substring(2) }
+  if (-not [IO.Path]::IsPathRooted($path)) { $path = Join-Path (Get-Location).Path $path }
+  return [IO.Path]::GetFullPath($path)
+}
+
+function Set-DshHome {
+  if ([string]::IsNullOrWhiteSpace($script:DshHome)) { $script:DshHome = Join-Path $HomeDir ".dsh" }
+  if ($script:DshHome -match "[\r\n]") { Exit-Die "DSH_HOME 不能包含换行符" }
+  $script:DshHome = ConvertTo-AbsolutePath $script:DshHome
+  $script:SkillDir = Join-Path $DshHome "skills/dsh-installer"
+  $script:SkillMarker = Join-Path $SkillDir ".installed-by-dsh-installer"
+  $env:DSH_HOME = $DshHome
+}
+
+function Test-SafeCleanupPath([string]$path) {
+  $full = (ConvertTo-AbsolutePath $path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  $root = [IO.Path]::GetPathRoot((ConvertTo-AbsolutePath $path)).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+  if ($full -eq $root) { return $false }
+  $protected = @($HomeDir, (Split-Path $PsScriptPath -Parent), "/usr", "/opt", "/etc", "/var", "/tmp", "/home", "/workspace")
+  if ($script:IsWin) { $protected = @($HomeDir, (Split-Path $PsScriptPath -Parent), $env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData) }
+  foreach ($item in $protected) {
+    if (-not $item) { continue }
+    $item = (ConvertTo-AbsolutePath $item).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if (($full -eq $item) -or $item.StartsWith($full + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+  }
+  $current = ConvertTo-AbsolutePath $path
+  while ($current) {
+    if (Test-Path -LiteralPath $current) {
+      $entry = Get-Item -LiteralPath $current -Force
+      if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    }
+    $parent = Split-Path $current -Parent
+    if ($parent -eq $current) { break }
+    $current = $parent
+  }
+  return $true
+}
+
+function Assert-PurgeHome {
+  if (-not (Test-SafeCleanupPath $DshHome)) { Exit-Die "拒绝删除不安全的数据路径: $DshHome" }
+  if ((Test-Path -LiteralPath $DshHome) -and (Split-Path $DshHome -Leaf) -ne ".dsh" -and
+      -not (Test-Path -LiteralPath (Join-Path $DshHome ".dsh-installer-home")) -and
+      -not (Test-Path -LiteralPath (Join-Path $DshHome "profiles"))) {
+    Exit-Die "自定义 DSH_HOME 缺少归属证据，保留: $DshHome"
+  }
+}
+
 # ---------------------------------------------------------------- 配置
 function Load-Config {
   if (Test-Path $ConfigFile) {
@@ -162,7 +225,10 @@ function Load-Config {
     if ($saved.port) { $script:Port = [int]$saved.port }
     if ($saved.registry) { $script:Registry = $saved.registry }
     if ($saved.nodeMajor) { $script:NodeMajor = $saved.nodeMajor }
+    if ($saved.dshHome -and [string]::IsNullOrWhiteSpace($DshHomeOverride)) { $script:DshHome = $saved.dshHome }
   }
+  Set-DshHome
+  Use-PrivateRuntimes
 }
 
 function Save-Config {
@@ -174,6 +240,7 @@ function Save-Config {
     port = $script:Port
     registry = $script:Registry
     nodeMajor = $script:NodeMajor
+    dshHome = $script:DshHome
   }
   $cfg | ConvertTo-Json | Set-Content -Path $ConfigFile -Encoding UTF8
 }
@@ -207,6 +274,7 @@ function Install-NodeViaWinget {
   if ($LASTEXITCODE -ne 0) { return $false }
   # 刷新当前进程 PATH（安装器新写入的 PATH 不会自动生效）
   $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+  Use-PrivateRuntimes
   return $true
 }
 
@@ -235,7 +303,6 @@ function Install-NodeViaZip {
   Remove-Item $zip -Force -ErrorAction SilentlyContinue
   New-Item -ItemType File -Path (Join-Path $NodeDir ".installed-by-dsh-installer") -Force | Out-Null
   Add-ToUserPath $NodeDir
-  $env:Path = $NodeDir + ";" + $env:Path
   Write-Ok "Node.js v$ver 已安装到 $NodeDir"
 }
 
@@ -252,33 +319,26 @@ function Ensure-Node {
   if (-not (Confirm-Action "是否自动安装 Node.js v$NodeMajor？" $true)) {
     Exit-Die "请先手动安装 Node.js >= 24（或 22.19+）: https://nodejs.org/"
   }
-  if (-not (Install-NodeViaWinget)) {
-    Write-Warn "winget 不可用或安装失败，改用官方 zip 安装"
-    Install-NodeViaZip
-  }
+  Install-NodeViaZip
   if (-not (Test-NodeOk)) { Exit-Die "Node.js 安装后仍不可用" }
 }
 
 # ---------------------------------------------------------------- pnpm / git
 function Ensure-Pnpm {
+  $prefix = Join-Path $CfgDir "pnpm"
+  Use-PrivateRuntimes
   if (Get-Command pnpm -ErrorAction SilentlyContinue) {
-    Write-Info "pnpm v$(& pnpm --version 2>$null | Select-Object -First 1) 已就绪"
+    Write-Info "pnpm 已就绪"
     return $true
   }
-  Write-Info "安装 pnpm@$PnpmVersion ..."
-  & npm install -g "pnpm@$PnpmVersion" *> $null
-  if (Get-Command pnpm -ErrorAction SilentlyContinue) { Write-Ok "pnpm 安装完成"; return $true }
-  # 回退：装到用户目录（无需管理员）
-  $prefix = Join-Path $LocalAppData "npm"
+  if ((Test-Path $prefix) -and -not (Test-Path (Join-Path $prefix ".installed-by-dsh-installer"))) { Exit-Die "pnpm 目录不属于本安装器: $prefix" }
   New-Item -ItemType Directory -Path $prefix -Force | Out-Null
-  & npm config set prefix $prefix *> $null
-  & npm install -g "pnpm@$PnpmVersion" *> $null
-  Add-ToUserPath $prefix
-  $env:Path = $prefix + ";" + $env:Path
-  if (Get-Command pnpm -ErrorAction SilentlyContinue) { Write-Ok "pnpm 安装完成"; return $true }
-  Write-Warn "pnpm 安装失败：插件管理功能将不可用"
-  Write-Warn "可手动执行: npm install -g pnpm@$PnpmVersion"
-  return $false
+  New-Item -ItemType File -Path (Join-Path $prefix ".installed-by-dsh-installer") -Force | Out-Null
+  Write-Info "安装 pnpm@$PnpmVersion 到 $prefix ..."
+  & npm install --global --prefix $prefix "pnpm@$PnpmVersion"
+  if ($LASTEXITCODE -ne 0) { return $false }
+  Use-PrivateRuntimes
+  return [bool](Get-Command pnpm -ErrorAction SilentlyContinue)
 }
 
 function Ensure-Git {
@@ -288,6 +348,7 @@ function Ensure-Git {
     if (Confirm-Action "通过 winget 安装 Git？" $true) {
       & winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements
       $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+      Use-PrivateRuntimes
       if (Get-Command git -ErrorAction SilentlyContinue) { return $true }
     }
   }
@@ -376,9 +437,23 @@ function Test-ValidConfig {
     Exit-Die "clone-url 含非法字符"
   }
   if ($BindHost -eq "0.0.0.0") {
-    if (-not (Confirm-Action "警告：绑定 0.0.0.0 会把 Web UI 暴露到局域网（当前无 TLS/认证）。仍要继续？" $false)) {
+    if (-not (Confirm-Action "警告：绑定 0.0.0.0 会把 Web UI 暴露到局域网（当前无 TLS；最新版使用进程访问令牌，请妥善保管启动日志）。仍要继续？" $false)) {
       Exit-Die "已取消（改用默认 127.0.0.1 即可）"
     }
+  }
+}
+
+function Write-CmdScript([string]$path, [object]$lines) {
+  $encoding = New-Object System.Text.UTF8Encoding($false)
+  [IO.File]::WriteAllLines($path, [string[]]@($lines), $encoding)
+}
+
+function Add-CmdRuntimePaths([object]$lines) {
+  # CMD may be started from a fresh terminal where system Node precedes user PATH.
+  # Check ownership at launch time; never prefer an unrelated directory.
+  foreach ($path in @((Join-Path $CfgDir "pnpm"), $NodeDir)) {
+    $marker = (Join-Path $path ".installed-by-dsh-installer").Replace('%', '%%')
+    $lines.Add('if exist "' + $marker + '" set "PATH=' + $path.Replace('%', '%%') + ';%PATH%"')
   }
 }
 
@@ -386,18 +461,23 @@ function Write-RunScript {
   New-Item -ItemType Directory -Path $CfgDir -Force | Out-Null
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add("@echo off")
+  $lines.Add("rem Generated by $AppName $AppVersion")
+  $lines.Add("chcp 65001 >nul")
+  $lines.Add("setlocal DisableDelayedExpansion")
+  $lines.Add('set "DSH_HOME=' + $DshHome.Replace('%', '%%') + '"')
+  Add-CmdRuntimePaths $lines
   if ($Mode -eq "source") {
-    $lines.Add('cd /d "' + $InstallDir + '"')
+    $lines.Add('cd /d "' + $InstallDir.Replace('%', '%%') + '"')
   } else {
     $lines.Add('cd /d "%USERPROFILE%"')
   }
   if ($Registry) { $lines.Add('set "NPM_CONFIG_REGISTRY=' + $Registry + '"') }
   if ($Mode -eq "source") {
-    $lines.Add("call pnpm.cmd dsh web --host $BindHost --port $Port")
+    $lines.Add("call pnpm.cmd dsh web --host $BindHost --port $Port --no-open")
   } else {
-    $lines.Add("call npx.cmd --yes $NpxPkg web --host $BindHost --port $Port")
+    $lines.Add("call npx.cmd --yes $NpxPkg web --host $BindHost --port $Port --no-open")
   }
-  Set-Content -Path $RunScript -Value $lines -Encoding Ascii
+  Write-CmdScript $RunScript $lines
 }
 
 function Start-Web {
@@ -556,7 +636,13 @@ function Show-Logs([object[]]$argsList = $null) {
 
 function Open-Web {
   Load-Config
-  Start-Process (Get-WebUrl)
+  $url = Get-WebUrl
+  if ((Test-Running) -and (Test-Path -LiteralPath $LogFile)) {
+    $pattern = '^dsh web: (http://127\.0\.0\.1:' + $Port + '/\?token=[A-Za-z0-9_-]+)$'
+    $match = Get-Content -LiteralPath $LogFile | Select-String -Pattern $pattern | Select-Object -Last 1
+    if ($match) { $url = $match.Matches[0].Groups[1].Value }
+  }
+  Start-Process $url
 }
 
 # ---------------------------------------------------------------- 安装
@@ -597,6 +683,7 @@ function Install-Npx {
 
 function Install-Source {
   Write-Step "源码安装"
+  $script:InstallDir = ConvertTo-AbsolutePath $script:InstallDir
   $repoUrl = $script:CloneUrl
   if (-not $repoUrl) { $repoUrl = $GithubRepo }
   $gitDir = Join-Path $InstallDir ".git"
@@ -747,6 +834,10 @@ function Invoke-Install([object[]]$argsList = $null) {
     Write-Ok "API Key 已写入 $envFile（也可稍后在 Web UI 设置页配置）"
   }
 
+  if (Test-SafeCleanupPath $DshHome) {
+    New-Item -ItemType Directory -Path $DshHome -Force | Out-Null
+    New-Item -ItemType File -Path (Join-Path $DshHome ".dsh-installer-home") -Force | Out-Null
+  }
   Write-Launcher
   Save-Config
 
@@ -767,17 +858,22 @@ function Write-Launcher {
   New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add("@echo off")
+  $lines.Add("rem Generated by $AppName $AppVersion")
+  $lines.Add("chcp 65001 >nul")
+  $lines.Add("setlocal DisableDelayedExpansion")
+  $lines.Add('set "DSH_HOME=' + $DshHome.Replace('%', '%%') + '"')
+  Add-CmdRuntimePaths $lines
   if ($Mode -eq "source") {
-    $lines.Add('cd /d "' + $InstallDir + '"')
+    $lines.Add('cd /d "' + $InstallDir.Replace('%', '%%') + '"')
     $lines.Add("call pnpm.cmd dsh web --host $BindHost --port $Port")
   } else {
     $lines.Add('cd /d "%USERPROFILE%"')
     if ($Registry) { $lines.Add('set "NPM_CONFIG_REGISTRY=' + $Registry + '"') }
     $lines.Add("call npx.cmd --yes $NpxPkg web --host $BindHost --port $Port")
   }
-  Set-Content -Path $Launcher -Value $lines -Encoding Ascii
-  $cliLines = @("@echo off", 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + $PsScriptPath + '" %*')
-  Set-Content -Path $CliLink -Value $cliLines -Encoding Ascii
+  Write-CmdScript $Launcher $lines
+  $cliLines = @("@echo off", "rem Generated by $AppName $AppVersion", "chcp 65001 >nul", "setlocal DisableDelayedExpansion", ('powershell -NoProfile -ExecutionPolicy Bypass -File "' + $PsScriptPath.Replace("%", "%%") + '" %*'))
+  Write-CmdScript $CliLink $cliLines
   # 把 BinDir 写入用户 PATH（当前进程同步生效）
   Add-ToUserPath $BinDir
   Write-Info ("已注册命令目录: " + $BinDir + "（新开终端后 dsh-web / dsh-installer 可直接使用）")
@@ -922,12 +1018,12 @@ function Get-NpxCacheDir {
 
 function Clear-NpxCache {
   $npxCache = Get-NpxCacheDir
-  if (-not (Test-Path $npxCache)) { return }
-  # _npx 是 npm 用户共享的缓存；只删除明确包含 dsh 的条目，不影响其他 npx 程序。
-  Get-ChildItem -LiteralPath $npxCache -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-    $dshPkg = Join-Path $_.FullName "node_modules/@deepseek-ai/dsh"
-    if (Test-Path $dshPkg) {
-      Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+  if (-not (Test-Path -LiteralPath $npxCache)) { return }
+  Get-ChildItem -LiteralPath $npxCache -Directory -ErrorAction Stop | ForEach-Object {
+    $manifest = Join-Path $_.FullName "node_modules/@deepseek-ai/dsh/package.json"
+    if (Test-Path -LiteralPath $manifest) {
+      try { $pkg = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json } catch { return }
+      if ($pkg.name -eq $NpxPkg) { Remove-CleanupItem $_.FullName $true }
     }
   }
 }
@@ -951,7 +1047,7 @@ function Find-ExternalPkgs {
   } catch { }
   # 版本管理器 / 常见全局目录
   $bases = New-Object System.Collections.Generic.List[string]
-  if ($env:NVM_HOME) { $bases.Add((Join-Path $env:NVM_HOME "node_modules")) }
+  if ($env:NVM_HOME) { $bases.Add($env:NVM_HOME) }
   if ($env:APPDATA) { $bases.Add((Join-Path $env:APPDATA "npm/node_modules")) }
   if ($env:ProgramFiles) { $bases.Add((Join-Path $env:ProgramFiles "nodejs/node_modules")) }
   $bases.Add((Join-Path $HomeDir ".nvm/versions/node"))
@@ -959,6 +1055,8 @@ function Find-ExternalPkgs {
   if ($env:LOCALAPPDATA) { $bases.Add((Join-Path $env:LOCALAPPDATA "fnm/node-versions")) }
   foreach ($base in $bases) {
     if (Test-Path $base) {
+      $direct = Join-Path $base "@deepseek-ai/dsh"
+      if (Test-Path -LiteralPath $direct) { $found.Add($direct) }
       Get-ChildItem $base -Directory -ErrorAction SilentlyContinue | ForEach-Object {
         foreach ($rel in @("lib/node_modules/@deepseek-ai/dsh", "installation/lib/node_modules/@deepseek-ai/dsh", "node_modules/@deepseek-ai/dsh")) {
           $p = Join-Path $_.FullName $rel
@@ -973,7 +1071,7 @@ function Find-ExternalPkgs {
 # 只删除能证明归属的 dsh shim（文件内容包含 @deepseek-ai/dsh 才算归属）
 function Remove-OwnedShims {
   $bases = New-Object System.Collections.Generic.List[string]
-  if ($env:NVM_HOME) { $bases.Add((Join-Path $env:NVM_HOME "node_modules")) }
+  if ($env:NVM_HOME) { $bases.Add($env:NVM_HOME) }
   if ($env:APPDATA) { $bases.Add((Join-Path $env:APPDATA "npm")) }
   $bases.Add((Join-Path $HomeDir ".nvm/versions/node"))
   $bases.Add((Join-Path $HomeDir ".volta/tools/image/node"))
@@ -999,7 +1097,7 @@ function Remove-OwnedShims {
 
 # 扫描并清理外部安装（独立危险操作：先展示清单，默认取消）
 function Test-SafeExternalSourceRepo([string]$path) {
-  if (($path -eq $HomeDir) -or ([System.IO.Path]::GetPathRoot($path) -eq $path)) {
+  if (-not (Test-SafeCleanupPath $path)) {
     Write-Warn ("拒绝删除不安全路径: " + $path)
     return $false
   }
@@ -1020,14 +1118,14 @@ function Test-SafeExternalSourceRepo([string]$path) {
     Write-Warn ("仓库 origin 非官方地址，保留: " + $path)
     return $false
   }
-  $dirty = ""
-  try { $dirty = & git -C $path status --porcelain 2>$null } catch { }
+  $dirty = & git -C $path status --porcelain 2>$null
+  if ($LASTEXITCODE -ne 0) { Write-Warn "无法验证仓库状态，保留: $path"; return $false }
   if ($dirty) {
     Write-Warn ("仓库有未提交改动，保留: " + $path)
     return $false
   }
   $localCommits = ""
-  try { $localCommits = [string]((& git -C $path rev-list --count HEAD --not --remotes 2>$null | Select-Object -First 1)).Trim() } catch { }
+  try { $localCommits = [string]((& git -C $path rev-list --count --all --not --remotes 2>$null | Select-Object -First 1)).Trim() } catch { }
   if ($localCommits -notmatch "^\d+$") {
     Write-Warn ("无法验证是否含仅本地提交，保留: " + $path)
     return $false
@@ -1052,9 +1150,11 @@ function Remove-ExternalInstalls([string]$extraDir = "") {
   Write-Warn "以下为本工具之外的安装（先展示清单，默认不删除）:"
   foreach ($item in $found) { Write-Host ("    " + $item) }
   Write-Host ""
+  if ($script:DryRun) { return 0 }
+  Assert-NoDshProcesses
   if (-not (Confirm-ExternalRemoval "确认清理以上全部外部安装？")) {
     Write-Info "已取消（核对清单后再执行）"
-    return 0
+    return 1
   }
   # 原生卸载（确认之后才执行）
   try { & npm uninstall -g $NpxPkg *> $null } catch { }
@@ -1065,19 +1165,24 @@ function Remove-ExternalInstalls([string]$extraDir = "") {
     $path = $item.Substring($type.Length + 1)
     if ($type -eq "global") {
       if (Test-Path $path) {
-        Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Ok ("已删除全局安装: " + $path)
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Remove-CleanupItem $path }
+        else {
+          try { $pkg = Get-Content -LiteralPath (Join-Path $path 'package.json') -Raw | ConvertFrom-Json } catch { $pkg = $null }
+          if ($pkg -and $pkg.name -eq $NpxPkg) { Remove-CleanupItem $path $true }
+          else { Write-Warn "无法确认包归属，保留: $path"; $script:CleanupFailed = $true }
+        }
       }
     } else {
       if (Test-SafeExternalSourceRepo $path) {
-        Remove-Item $path -Recurse -Force
-        Write-Ok ("已删除源码仓库: " + $path)
-      }
+        Remove-CleanupItem $path $true
+      } else { $script:CleanupFailed = $true }
     }
   }
   Remove-OwnedShims
   $dshCmd = Get-Command dsh -ErrorAction SilentlyContinue
   if ($dshCmd) { Write-Warn ("PATH 中仍存在 dsh 命令: " + $dshCmd.Source + "（如仍存在请手动处理）") }
+  if ($script:CleanupFailed) { return 1 }
   Write-Ok "外部安装清理流程结束"
   return 0
 }
@@ -1089,11 +1194,32 @@ function Find-SourceRepos {
   $bases = New-Object System.Collections.Generic.List[string]
   $bases.Add($HomeDir)
   foreach ($n in $names) { $bases.Add((Join-Path $HomeDir $n)) }
+  if ((Test-Path (Join-Path $InstallDir ".git")) -and (Test-RepoMarker $InstallDir)) { $found.Add($InstallDir) }
   foreach ($base in $bases) {
     $c = Join-Path $base "deepseek-harness"
     if ((Test-Path (Join-Path $c ".git")) -and (Test-RepoMarker $c)) { $found.Add($c) }
   }
   return @($found)
+}
+
+function Invoke-RemoveExternal {
+  $extraDir = ""
+  $script:DryRun = $false; $script:CleanupFailed = $false
+  for ($i = 0; $i -lt $RestArgs.Count; $i++) {
+    switch ([string]$RestArgs[$i]) {
+      "--dry-run" { $script:DryRun = $true }
+      { $_ -eq "--dir" -or $_ -eq "-d" } {
+        if ($i + 1 -ge $RestArgs.Count) { Exit-Die "--dir 缺少路径" }
+        $i++; $extraDir = [string]$RestArgs[$i]
+      }
+      { $_ -like "--dir=*" } { $extraDir = $_.Substring(6) }
+      "-y" { $script:Yes = $true }
+      "--yes" { $script:Yes = $true }
+      default { Exit-Die "未知选项: $($RestArgs[$i])" }
+    }
+  }
+  Load-Config
+  if ((Remove-ExternalInstalls $extraDir) -ne 0) { exit 1 }
 }
 
 # ---------------------------------------------------------------- 更新
@@ -1197,7 +1323,7 @@ description: 可选的实验性 DeepSeek Harness 安装、服务与插件管理�
 
 ## 规则
 1. 不要为了自动化而默认追加 `-y`；只有用户明确希望非交互执行时才加。
-2. `uninstall` 默认保留 `~/.dsh` 数据。绝不默认加入 `--purge` 或 `--remove-external`；这两项会删除数据或其他安装，必须单独、再次获得用户确认。
+2. `uninstall` 默认保留已登记的 `DSH_HOME` 数据。可先用 `uninstall --purge --dry-run` 预览。绝不默认加入 `--purge`、`--purge-temp` 或 `--remove-external`；这些选项会删除数据或其他安装，必须单独、再次获得用户确认。
 3. 安装/移除插件后可能需要重启 Web UI 才生效。先说明影响，再按用户指示执行。
 4. 要求 Node.js >= 22.19 或 >=24；缺失时安装器可能安装到用户目录。国内网络失败时可由用户选择 `--registry https://registry.npmmirror.com`。
 5. 失败先查看 **dsh-installer logs -n 30**，不要通过扩大删除范围或放松 pnpm 安全闸门来“修复”。
@@ -1214,110 +1340,180 @@ function Invoke-Skill {
 }
 
 # ---------------------------------------------------------------- 卸载
+function Test-OwnedLauncher([string]$path) {
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+  try { $content = Get-Content -LiteralPath $path -Raw -ErrorAction Stop } catch { return $false }
+  if ([string]::IsNullOrEmpty($content)) { return $false }
+  if ($content -match ('(?m)^rem Generated by ' + [regex]::Escape($AppName) + ' [0-9]+\.[0-9]+\.[0-9]+\r?$')) { return $true }
+
+  # v1.2 did not write a marker. Only accept its complete template with the
+  # saved installation settings, or the exact existing installer script path.
+  if (-not (Test-Path -LiteralPath $ConfigFile -PathType Leaf)) { return $false }
+  try { $saved = Get-Content -LiteralPath $ConfigFile -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json } catch { return $false }
+  if (@('npx', 'source') -notcontains $saved.mode -or @('127.0.0.1', '0.0.0.0') -notcontains $saved.host -or
+      ([string]$saved.port) -notmatch '^\d+$' -or [int]$saved.port -lt 1 -or [int]$saved.port -gt 65535) { return $false }
+  $expected = @('@echo off')
+  $legacySplitCli = @()
+  if ($path -eq $CliLink) {
+    if (-not (Test-Path -LiteralPath $PsScriptPath -PathType Leaf)) { return $false }
+    $actualScript = (Resolve-Path -LiteralPath $PsScriptPath).Path
+    $expected += 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + $actualScript + '" %*'
+    # The v1.2 comma/+ precedence bug emitted these four exact lines.
+    $legacySplitCli = @('@echo off', 'powershell -NoProfile -ExecutionPolicy Bypass -File "', $actualScript, '" %*')
+  } elseif ($path -eq $Launcher) {
+    if ($saved.mode -eq 'source') {
+      if ([string]::IsNullOrWhiteSpace($saved.installDir)) { return $false }
+      $expected += 'cd /d "' + $saved.installDir + '"'
+      $expected += "call pnpm.cmd dsh web --host $($saved.host) --port $($saved.port)"
+    } else {
+      $expected += 'cd /d "%USERPROFILE%"'
+      if ($saved.registry) { $expected += 'set "NPM_CONFIG_REGISTRY=' + $saved.registry + '"' }
+      $expected += "call npx.cmd --yes $NpxPkg web --host $($saved.host) --port $($saved.port)"
+    }
+  } else { return $false }
+  $normalized = $content.Replace("`r`n", "`n").TrimEnd([char[]]"`r`n")
+  return (($normalized -ceq ($expected -join "`n")) -or
+    ($legacySplitCli.Count -gt 0 -and $normalized -ceq ($legacySplitCli -join "`n")))
+}
+
+function Remove-CleanupItem([string]$path, [bool]$tree = $false) {
+  if (-not (Test-Path -LiteralPath $path) -and -not (Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue)) { return }
+  if ($tree -and -not (Test-SafeCleanupPath $path)) {
+    Write-Warn "保留不安全路径: $path"
+    $script:CleanupFailed = $true
+    return
+  }
+  Write-Info "删除: $path"
+  if ($script:DryRun) { return }
+  try {
+    if ($tree) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop }
+    else { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+  } catch {
+    Write-Err "删除失败: $path ($($_.Exception.Message))"
+    $script:CleanupFailed = $true
+  }
+}
+
+function Test-DshProcess($process) {
+  # Native npm CMD shims pass backslashes, while PowerShell shims use slashes.
+  $commandLine = ([string]$process.CommandLine).Replace('\', '/')
+  return (($process.Name -match '^(node|npm|pnpm|npx)(\.exe)?$') -and
+    ($commandLine -match 'apps/cli/(src|lib)/bin\.(ts|js)|@deepseek-ai/dsh(?:/|@|[\s"'']|$)|[ /]dsh web|deepseek-harness/packages/'))
+}
+
+function Assert-NoDshProcesses {
+  if (-not $script:IsWin) { return }
+  try { $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+  catch { Exit-Die "无法验证 DSH 进程，保留安装和数据" }
+  if (@($processes | Where-Object { Test-DshProcess $_ }).Count) {
+    Exit-Die "仍有其他 DSH 实例，先停止所有实例再清理"
+  }
+}
+
+function Remove-DshTemp {
+  # Windows 使用 CIM 检查命令行和 ACL 所有者；不猜测共享临时目录的归属。
+  if (-not $script:IsWin) { Write-Warn "PowerShell 临时清理仅支持 Windows；macOS/Linux 请用 install.sh"; $script:CleanupFailed = $true; return }
+  try { $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+  catch { Write-Err "无法验证 DSH 进程，保留临时目录"; $script:CleanupFailed = $true; return }
+  if (@($processes | Where-Object { Test-DshProcess $_ }).Count) {
+    Write-Err "仍有 DSH 进程，停止所有实例后再清理临时目录"
+    $script:CleanupFailed = $true
+    return
+  }
+  $owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $root = [IO.Path]::GetTempPath()
+  foreach ($entry in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction Stop)) {
+    if ($entry.Name -notmatch "^(dsh-(subprocess-launch|shell|subprocess|spill|ptc-runtime-python|native-command|acl-skill|stagehand-chrome)-.+|dsh-drops)$") { continue }
+    if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+    try { $acl = Get-Acl -LiteralPath $entry.FullName -ErrorAction Stop } catch { continue }
+    if ($acl.Owner -ieq $owner) { Remove-CleanupItem $entry.FullName $true }
+  }
+}
+
 function Invoke-Uninstall([object[]]$argsList = $null) {
   if ($null -eq $argsList) { $argsList = @($RestArgs) }
-  $purge = $false
-  $extraDir = ""
-  $removeExternal = $false
+  $purge = $false; $purgeTemp = $false; $extraDir = ""; $removeExternal = $false
+  $script:DryRun = $false; $script:CleanupFailed = $false
   for ($i = 0; $i -lt $argsList.Count; $i++) {
     switch ([string]$argsList[$i]) {
       "--purge" { $purge = $true }
+      "--purge-temp" { $purgeTemp = $true }
+      "--dry-run" { $script:DryRun = $true }
       "--remove-external" { $removeExternal = $true }
-      "-d" { if ($argsList[$i + 1]) { $extraDir = [string]$argsList[$i + 1]; $i++ } }
-      "--dir" { if ($argsList[$i + 1]) { $extraDir = [string]$argsList[$i + 1]; $i++ } }
+      { $_ -eq "-d" -or $_ -eq "--dir" } {
+        if ($i + 1 -ge $argsList.Count) { Exit-Die "--dir 缺少路径" }
+        $i++; $extraDir = [string]$argsList[$i]
+      }
       { $_ -like "--dir=*" } { $extraDir = $_.Substring(6) }
       "-y" { $script:Yes = $true }
       "--yes" { $script:Yes = $true }
       "-q" { $script:Quiet = $true }
       "--quiet" { $script:Quiet = $true }
-      default { Exit-Die "未知选项: $argsList[$i]" }
+      "--help" { Show-Usage; return }
+      default { Exit-Die "未知选项: $($argsList[$i])" }
     }
   }
+  if ($purgeTemp -and -not $purge) { Exit-Die "--purge-temp 需与 --purge 同用" }
   Load-Config
   if (-not $script:Mode) { $script:Mode = "npx" }
-  if ((-not [Environment]::UserInteractive) -and (-not $script:Yes)) {
-    Exit-Die "卸载需确认：非交互调用请加 -y"
+  $script:InstallDir = ConvertTo-AbsolutePath $script:InstallDir
+  if ($purge) { Assert-PurgeHome }
+  if (-not (Test-SafeCleanupPath $CfgDir)) { Exit-Die "不安全的安装器配置目录: $CfgDir" }
+  if ($script:DryRun) { Write-Info "预览模式：不会停止进程、删除文件或修改 PATH" }
+  else {
+    if ((-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) -and -not $script:Yes) { Exit-Die "卸载需确认：非交互调用请加 -y" }
+    if (-not (Confirm-Action "确定卸载本工具安装的 DeepSeek Harness？" $false)) { Write-Info "已取消"; return }
+    $stopResult = Stop-Web
+    if ($stopResult -eq 1) { Exit-Die "服务未安全停止，保留安装和数据" }
+    Assert-NoDshProcesses
   }
-  if (-not (Confirm-Action "确定卸载本工具安装的 DeepSeek Harness？" $false)) {
-    Write-Info "已取消"
-    exit 0
+  $sourceMarker = Join-Path $InstallDir $script:SourceMarkerName
+  if ((Test-RepoMarker $InstallDir) -and (Test-Path -LiteralPath $sourceMarker)) {
+    $dirty = & git -C $InstallDir status --porcelain 2>$null
+    $dirtyFailed = $LASTEXITCODE -ne 0
+    $commits = & git -C $InstallDir rev-list --count --all --not --remotes 2>$null
+    if ($dirtyFailed -or $dirty -or $LASTEXITCODE -ne 0 -or ([string]$commits).Trim() -ne "0") {
+      if (-not $script:DryRun -and (Confirm-ExternalRemoval "源码含本地改动/提交或无法验证，仍删除 $InstallDir？")) { Remove-CleanupItem $InstallDir $true }
+      else { Write-Warn "保留源码（本地改动/提交或无法验证）: $InstallDir"; $script:CleanupFailed = $true }
+    } else { Remove-CleanupItem $InstallDir $true }
+  } elseif ($Mode -eq "source" -and (Test-Path -LiteralPath $InstallDir)) { Write-Warn "保留外部源码: $InstallDir；可用 --remove-external 单独确认清理" }
+  Clear-NpxCache
+  foreach ($path in @($Launcher, $CliLink)) {
+    if (Test-OwnedLauncher $path) { Remove-CleanupItem $path }
   }
-  Write-Info "停止服务 ..."
-  $stopResult = Stop-Web
-  if ($stopResult -eq 1) {
-    Write-Warn "服务停止未完全生效，继续卸载（若端口仍被占用请手动结束进程）"
+  if (Test-Path -LiteralPath $SkillMarker) { Remove-CleanupItem $SkillDir $true }
+  $ownedNode = Test-Path -LiteralPath (Join-Path $NodeDir ".installed-by-dsh-installer")
+  $ownedRuntime = @($NodeDir, (Join-Path $CfgDir "pnpm"))
+  foreach ($path in $ownedRuntime) {
+    if (Test-Path -LiteralPath (Join-Path $path ".installed-by-dsh-installer")) { Remove-CleanupItem $path $true }
   }
-
-  # ---- 只清理本工具确认拥有的资源（默认不扫、不猜、不扩大范围）----
-  if ($Mode -eq "source") {
-    $sourceMarker = Join-Path $InstallDir $script:SourceMarkerName
-    if ((Test-Path $InstallDir) -and (Test-RepoMarker $InstallDir) -and (Test-Path $sourceMarker)) {
-      $dirty = ""
-      try { $dirty = & git -C $InstallDir status --porcelain 2>$null } catch { }
-      if ($dirty -and -not (Confirm-Action "源码目录存在未提交改动，仍要删除？" $false)) {
-        Write-Warn ("已跳过源码目录: " + $InstallDir)
-      } else {
-        Write-Info "删除源码目录: $InstallDir"
-        Remove-Item $InstallDir -Recurse -Force
-      }
-    } elseif ((Test-Path $InstallDir) -and (Test-RepoMarker $InstallDir)) {
-      Write-Warn "源码目录缺少本安装器归属标记（可能是用户原有或旧版本安装），为安全起见保留: $InstallDir"
-    } else {
-      Write-Info "源码目录不存在或非 DSH 仓库，跳过"
-    }
-  } else {
-    Write-Info "清理 npx 缓存中的 dsh ..."
-    Clear-NpxCache
-  }
-
-  Remove-Item $Launcher -Force -ErrorAction SilentlyContinue
-  Remove-Item $CliLink -Force -ErrorAction SilentlyContinue
-  if (Test-Path $SkillMarker) {
-    Remove-Item $SkillDir -Recurse -Force -ErrorAction SilentlyContinue
-  } elseif (Test-Path $SkillDir) {
-    Write-Warn "Skill 目录缺少本安装器归属标记，保留: $SkillDir"
-  }
-  if (Test-Path (Join-Path $NodeDir ".installed-by-dsh-installer")) {
-    Remove-Item $NodeDir -Recurse -Force
-  }
-  Remove-Item $CfgDir -Recurse -Force -ErrorAction SilentlyContinue
-
-  # 清理安装器写入的用户 PATH 条目
-  try {
-    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if ($userPath) {
-      $kept = @(($userPath -split ";") | Where-Object { $_ -and ($_.TrimEnd("\\") -ine $BinDir.TrimEnd("\\")) }) -join ";"
-      if ($kept -ne $userPath) {
-        [Environment]::SetEnvironmentVariable("Path", $kept, "User")
-        Write-Info "已清理用户 PATH 中的安装器条目"
-      }
-    }
-  } catch { }
-
   if ($purge) {
-    $leaf = Split-Path $DshHome -Leaf
-    if ($leaf -ne ".dsh") {
-      Exit-Die "拒绝删除不安全路径: $DshHome（--purge 仅允许删除 ~/.dsh 形态的数据目录）"
+    if ($script:DryRun -or (Confirm-Action "删除 $DshHome 的会话、凭据、插件、附件及运行时缓存？" $false)) { Remove-CleanupItem $DshHome $true }
+    else { Write-Warn "保留数据目录: $DshHome" }
+  } else { Write-Info "保留数据目录: $DshHome（--purge 可清理）" }
+  if ($purgeTemp) { Remove-DshTemp }
+  if ($removeExternal) { if ((Remove-ExternalInstalls $extraDir) -ne 0) { $script:CleanupFailed = $true } }
+  if (-not $script:CleanupFailed) {
+    foreach ($path in @($RunScript, $PidFile, $LogFile, $ErrLogFile, $ConfigFile)) { Remove-CleanupItem $path }
+  }
+  # 仅移除本安装器的两个路径，不动系统或第三方 Node/pnpm。
+  if ($script:IsWin) {
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $removePaths = @($BinDir)
+    if ($ownedNode) { $removePaths += $NodeDir }
+    $kept = @($userPath -split ";" | Where-Object { $_ -and ($removePaths -inotcontains $_.TrimEnd("\")) }) -join ";"
+    if ($kept -ne $userPath -and $userPath) {
+      Write-Info "移除安装器的用户 PATH 条目"
+      if (-not $script:DryRun -and -not $script:CleanupFailed) { [Environment]::SetEnvironmentVariable("Path", $kept, "User") }
     }
-    if (Confirm-Action "同时删除全部数据目录 $DshHome（会话、配置、插件全部丢失）？" $false) {
-      Remove-Item $DshHome -Recurse -Force -ErrorAction SilentlyContinue
-      Write-Ok "已删除数据目录"
-    } else {
-      Write-Info "保留数据目录: $DshHome"
+  }
+  if (-not $script:DryRun) {
+    foreach ($path in @($BinDir, $CfgDir)) {
+      if ((Test-Path -LiteralPath $path) -and -not @(Get-ChildItem -LiteralPath $path -Force).Count) { Remove-Item -LiteralPath $path -Force }
     }
   }
-
-  Write-Ok "卸载完成"
-  if (-not $purge) { Write-Info "提示: 数据目录 $DshHome 已保留，如需彻底删除请用 --purge" }
-  if ($Mode -eq "npx") {
-    Write-Info "说明: npx 模式无驻留安装，npx @deepseek-ai/dsh web 本身随时可再次运行（已清理本地缓存/启动器/技能）"
-  }
-  # 外部安装清理是独立的危险操作，默认不执行
-  if ($removeExternal) {
-    $null = Remove-ExternalInstalls $extraDir
-  } elseif ($extraDir) {
-    Write-Warn "提示: --dir 仅在 --remove-external 时生效"
-  }
+  if ($script:CleanupFailed) { Exit-Die "清理未完成，已保留配置；检查以上保留/失败项后重试" }
+  if ($script:DryRun) { Write-Ok "预览结束" } else { Write-Ok "卸载完成" }
 }
 
 # ---------------------------------------------------------------- 交互菜单
@@ -1465,7 +1661,7 @@ DeepSeek Harness 多平台安装器 (Windows)
   info         查看环境与安装信息（--json）
   open         在浏览器打开 Web UI
   skill        注册可选实验性 dsh Skill（未经完整测试；默认不注册）
-  uninstall    卸载（--purge 同时删除 ~/.dsh 数据目录）
+  uninstall    卸载（--purge 删除 DSH_HOME；--dry-run 预览；--purge-temp 清临时残留）
   version      显示版本号
 
 通用选项:
@@ -1486,6 +1682,7 @@ DeepSeek Harness 多平台安装器 (Windows)
 }
 
 # ---------------------------------------------------------------- 入口
+if ($MyInvocation.InvocationName -eq ".") { return }
 # PowerShell 会把 `install.ps1 --help` 放进 RestArgs，而不是绑定到 Command。
 # 先标准化顶层别名，避免无意进入交互菜单或开始默认安装。
 $hasExplicitCommand = $PSBoundParameters.ContainsKey("Command")
@@ -1539,7 +1736,7 @@ switch ($Command.ToLower()) {
   "open" { Open-Web }
   "skill" { Invoke-Skill }
   "uninstall" { Invoke-Uninstall }
-  "remove-external" { $null = Remove-ExternalInstalls "" }
+  "remove-external" { Invoke-RemoveExternal }
   "version" { Write-Host $AppVersion }
   "-v" { Write-Host $AppVersion }
   "-V" { Write-Host $AppVersion }

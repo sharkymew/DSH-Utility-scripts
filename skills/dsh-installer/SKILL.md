@@ -19,7 +19,7 @@ description: 可选的实验性 DeepSeek Harness 安装、服务与插件管理�
 
 ## 规则
 1. 不要为了自动化而默认追加 `-y`；只有用户明确希望非交互执行时才加。
-2. `uninstall` 默认保留 `~/.dsh` 数据。绝不默认加入 `--purge` 或 `--remove-external`；这两项会删除数据或其他安装，必须单独、再次获得用户确认。
+2. `uninstall` 默认保留已登记的 `DSH_HOME` 数据。可先用 `uninstall --purge --dry-run` 预览。绝不默认加入 `--purge`、`--purge-temp` 或 `--remove-external`；这些选项会删除数据或其他安装，必须单独、再次获得用户确认。
 3. 安装/移除插件后可能需要重启 Web UI 才生效。先说明影响，再按用户指示执行。
 4. 要求 Node.js >= 22.19 或 >=24；缺失时安装器可能安装到用户目录。国内网络失败时可由用户选择 `--registry https://registry.npmmirror.com`。
 5. 失败先查看 **dsh-installer logs -n 30**，不要通过扩大删除范围或放松 pnpm 安全闸门来“修复”。
